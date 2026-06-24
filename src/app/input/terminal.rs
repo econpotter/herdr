@@ -18,13 +18,17 @@ fn is_modifier_only_key(code: &KeyCode) -> bool {
 }
 
 impl App {
-    pub(crate) fn handle_terminal_key_headless(&mut self, key: TerminalKey) {
+    /// Returns true when the key was forwarded to the focused pane (rather than
+    /// consumed as an app action / keybind / prefix). A forwarded key changes
+    /// only pane content, so the render loop can take the cheap retained path.
+    pub(crate) fn handle_terminal_key_headless(&mut self, key: TerminalKey) -> bool {
         let Some(input) = self.prepare_terminal_key_forward(key) else {
-            return;
+            return false;
         };
         if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
             let _ = runtime.try_send_bytes(input.bytes);
         }
+        true
     }
 
     fn prepare_terminal_key_forward(&mut self, key: TerminalKey) -> Option<PreparedPaneInput> {

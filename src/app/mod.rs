@@ -1483,11 +1483,17 @@ impl App {
         self.route_client_events(events, true);
     }
 
+    /// Routes client input events. Returns true when every rendering-relevant
+    /// event was a key forwarded straight to the focused pane (no app action,
+    /// mode change, mouse, paste, or theme change) — the precondition for the
+    /// render loop to take the cheap retained path instead of a full render.
     pub(crate) fn route_client_events(
         &mut self,
         events: Vec<crate::raw_input::RawInputEvent>,
         apply_host_terminal_theme: bool,
-    ) {
+    ) -> bool {
+        let mut only_pane_forwarded = true;
+        let mut saw_pane_forward = false;
         for event in events {
             let previous_mode = self.state.mode;
             match event {
@@ -1497,20 +1503,29 @@ impl App {
                         crossterm::event::KeyEventKind::Press => {
                             if self.state.mode == Mode::Terminal {
                                 self.suppressed_repeat_keys.remove(&key_id);
-                                self.handle_terminal_key_headless(key);
+                                if self.handle_terminal_key_headless(key) {
+                                    saw_pane_forward = true;
+                                } else {
+                                    only_pane_forwarded = false;
+                                }
                             } else {
                                 self.suppressed_repeat_keys.insert(key_id);
                                 self.handle_non_terminal_key_headless(key);
+                                only_pane_forwarded = false;
                             }
                         }
                         crossterm::event::KeyEventKind::Repeat => {
                             if self.state.mode == Mode::Terminal
                                 && !self.suppressed_repeat_keys.contains(&key_id)
                             {
-                                self.handle_terminal_key_headless(key);
+                                if self.handle_terminal_key_headless(key) {
+                                    saw_pane_forward = true;
+                                } else {
+                                    only_pane_forwarded = false;
+                                }
                             }
                             // Repeats in non-terminal modes are ignored
-                            // (same as monolithic behavior).
+                            // (same as monolithic behavior) — render-neutral.
                         }
                         crossterm::event::KeyEventKind::Release => {
                             self.suppressed_repeat_keys.remove(&key_id);
@@ -1518,6 +1533,7 @@ impl App {
                     }
                 }
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                    only_pane_forwarded = false;
                     if self.state.mouse_capture {
                         self.handle_mouse_event_headless(mouse);
                     } else {
@@ -1526,6 +1542,7 @@ impl App {
                     }
                 }
                 crate::raw_input::RawInputEvent::Paste(text) => {
+                    only_pane_forwarded = false;
                     if self.state.mode != Mode::Terminal {
                         self.paste_into_active_text_input(&text);
                     } else {
@@ -1557,11 +1574,13 @@ impl App {
                 crate::raw_input::RawInputEvent::OuterFocusGained
                 | crate::raw_input::RawInputEvent::OuterFocusLost => {}
                 crate::raw_input::RawInputEvent::HostDefaultColor { kind, color } => {
+                    only_pane_forwarded = false;
                     if apply_host_terminal_theme {
                         self.update_host_terminal_theme(kind, color);
                     }
                 }
                 crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
+                    only_pane_forwarded = false;
                     if apply_host_terminal_theme {
                         self.set_host_terminal_appearance(appearance, true);
                     }
@@ -1570,6 +1589,7 @@ impl App {
             }
             self.sync_prefix_input_source(previous_mode);
         }
+        only_pane_forwarded && saw_pane_forward
     }
 
     /// Handles a key event in non-terminal mode for the headless server.

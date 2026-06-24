@@ -249,6 +249,11 @@ pub struct HeadlessServer {
     /// Pooled sidebar renderer reused across spinner-tick retained sidebar
     /// updates to avoid per-tick screen-sized buffer allocation and clone.
     sidebar_renderer: crate::server::render_stream::SidebarRenderer,
+    /// Set by `handle_server_event` when the just-handled event was client input
+    /// that only forwarded keys to the focused pane (no app-chrome change). The
+    /// render loop uses it to take the cheap retained path instead of a full
+    /// render. Reset at the start of every `handle_server_event`.
+    input_render_pane_only: bool,
 }
 
 fn apply_terminal_attach_scroll(
@@ -436,6 +441,7 @@ impl HeadlessServer {
             server_event_tx,
             virtual_renderer: crate::server::render_stream::VirtualRenderer::new(),
             sidebar_renderer: crate::server::render_stream::SidebarRenderer::new(),
+            input_render_pane_only: false,
         })
     }
 
@@ -467,6 +473,11 @@ impl HeadlessServer {
         // can be streamed via the cheap sidebar-only retained path instead of a
         // full virtual render. Reset after every render.
         let mut chrome_only = false;
+        // True when a render is pending solely because client input was forwarded
+        // to the focused pane. The pane's pty echo (if any) drives the retained
+        // path; we attempt retained even without a pty-dirty flag so the cheap
+        // path runs instead of a full virtual render. Reset after every render.
+        let mut pane_only_input = false;
 
         loop {
             crate::render_prof::event("loop.tick");
@@ -512,10 +523,15 @@ impl HeadlessServer {
             self.accept_client_connections()?;
 
             // 5. Drain server events from client threads.
-            if self.drain_server_events() {
+            let (server_changed, server_requires_full) = self.drain_server_events();
+            if server_changed {
                 needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.server_events");
+                if server_requires_full {
+                    needs_full_render = true;
+                    crate::render_prof::event("full_render_cause.server_events");
+                } else {
+                    pane_only_input = true;
+                }
             }
 
             // 6. Handle scheduled tasks.
@@ -642,7 +658,7 @@ impl HeadlessServer {
                 } else if !pty_dirty {
                     crate::render_prof::event("retained_gate.not_pty_dirty");
                 }
-                let rendered_retained = pty_dirty
+                let rendered_retained = (pty_dirty || pane_only_input)
                     && !needs_full_render
                     && !chrome_only
                     && self.render_retained_pty_update_and_stream();
@@ -659,6 +675,7 @@ impl HeadlessServer {
                 needs_render = false;
                 needs_full_render = false;
                 chrome_only = false;
+                pane_only_input = false;
                 continue;
             }
 
@@ -711,8 +728,13 @@ impl HeadlessServer {
                     let cause = Self::server_event_render_cause(&ev);
                     if self.handle_server_event(ev) {
                         needs_render = true;
-                        needs_full_render = true;
-                        crate::render_prof::event(cause);
+                        if self.input_render_pane_only {
+                            pane_only_input = true;
+                            crate::render_prof::event("retained_eligible.server_event");
+                        } else {
+                            needs_full_render = true;
+                            crate::render_prof::event(cause);
+                        }
                     }
                 }
                 LoopEvent::RenderRequested => {
@@ -1329,16 +1351,25 @@ impl HeadlessServer {
     /// Drains server events from the dedicated channel.
     ///
     /// Returns true if any input was processed (requiring a re-render).
-    fn drain_server_events(&mut self) -> bool {
+    /// Drains queued server events. Returns `(changed, requires_full_render)`.
+    /// `requires_full_render` is false only when every event that needs a render
+    /// was fully pane-forwarded client input (retained-eligible).
+    fn drain_server_events(&mut self) -> (bool, bool) {
         let mut changed = false;
+        let mut requires_full = false;
         while let Ok(ev) = self.server_event_rx.try_recv() {
             let cause = Self::server_event_render_cause(&ev);
             if self.handle_server_event(ev) {
                 changed = true;
-                crate::render_prof::event(cause);
+                if self.input_render_pane_only {
+                    crate::render_prof::event("retained_eligible.server_event");
+                } else {
+                    requires_full = true;
+                    crate::render_prof::event(cause);
+                }
             }
         }
-        changed
+        (changed, requires_full)
     }
 
     fn terminal_id_by_string(&self, terminal_id: &str) -> Option<crate::terminal::TerminalId> {
@@ -2296,13 +2327,32 @@ impl HeadlessServer {
             self.resize_shared_runtime_to_effective_size_before_input();
         }
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
-        self.app
+        let mode_before = self.app.state.mode;
+        // A forwarded key clears any active text selection (the first thing
+        // prepare_terminal_key_forward does). The retained gate only checks that
+        // no selection exists *now*, so it can't tell the highlight was just
+        // removed — force a full render when a selection was active.
+        let selection_active_before = self.app.state.selection.is_some();
+        let only_pane_forwarded = self
+            .app
             .route_client_events(events, self.foreground_client_id == Some(client_id));
         if self.app.take_config_reloaded_from_disk() {
             self.reload_server_config(false);
         } else {
             self.sync_foreground_client_state();
         }
+
+        // Pane-forwarded input (keys to the focused pane) changes only pane
+        // content; the pty echo drives the cheap retained render. Everything that
+        // can change app chrome (mode change, focus redraw, foreground/theme
+        // change, clearing a selection) forces a full render instead.
+        self.input_render_pane_only = only_pane_forwarded
+            && !host_surface_redraw
+            && !foreground_changed
+            && !theme_changed
+            && !selection_active_before
+            && mode_before == app::Mode::Terminal
+            && self.app.state.mode == app::Mode::Terminal;
 
         if self.app.state.detach_requested {
             self.app.state.detach_requested = false;
@@ -2359,6 +2409,9 @@ impl HeadlessServer {
     }
 
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
+        // Default: this event needs a full render. Only fully pane-forwarded
+        // client input clears this (in handle_client_input_events).
+        self.input_render_pane_only = false;
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
             return false;
         }
@@ -4175,6 +4228,7 @@ mod tests {
             server_event_tx,
             virtual_renderer: crate::server::render_stream::VirtualRenderer::new(),
             sidebar_renderer: crate::server::render_stream::SidebarRenderer::new(),
+            input_render_pane_only: false,
         }
     }
 
@@ -6675,6 +6729,70 @@ next_tab = ""
         assert!(
             client_rx.recv_timeout(Duration::from_millis(100)).is_ok(),
             "semantic client must receive a post-input frame even when content is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_key_is_retained_eligible() {
+        let (mut server, client_rx, _pane_id) = retained_test_server(b"hello");
+        server.render_and_stream();
+        let _ = client_rx.recv_timeout(Duration::from_millis(100));
+
+        // A printable key in Terminal mode forwards straight to the focused
+        // pane and changes no app chrome.
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"a".to_vec(),
+        }));
+        assert!(
+            server.input_render_pane_only,
+            "a key forwarded to the focused pane must be retained-eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_outside_terminal_mode_forces_full_render() {
+        let (mut server, client_rx, _pane_id) = retained_test_server(b"hello");
+        server.render_and_stream();
+        let _ = client_rx.recv_timeout(Duration::from_millis(100));
+
+        // Outside Terminal mode the key is consumed as an app action, not
+        // forwarded — it can change chrome, so it must force a full render.
+        server.app.state.mode = crate::app::Mode::Navigate;
+        server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"j".to_vec(),
+        });
+        assert!(
+            !server.input_render_pane_only,
+            "input handled outside Terminal mode must force a full render"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_input_event_is_not_retained_eligible() {
+        let (mut server, client_rx, _pane_id) = retained_test_server(b"hello");
+        server.render_and_stream();
+        let _ = client_rx.recv_timeout(Duration::from_millis(100));
+
+        // Mark a forwarded key first so the flag is set true...
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"a".to_vec(),
+        }));
+        assert!(server.input_render_pane_only);
+
+        // ...then a non-input server event must clear it (defaults to full).
+        server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 1,
+            cols: 81,
+            rows: 25,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        });
+        assert!(
+            !server.input_render_pane_only,
+            "a non-input server event must reset the retained-eligible flag"
         );
     }
 
