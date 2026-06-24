@@ -12,7 +12,13 @@ use crate::terminal::TerminalRuntimeRegistry;
 /// Per-client render baseline for the negotiated render encoding.
 pub(crate) enum ClientRenderState {
     /// Semantic clients compare full frame data and skip identical frames.
-    Semantic { last_frame: Option<FrameData> },
+    /// `force_send` makes the next frame ship even if it equals the baseline,
+    /// without discarding the baseline — so the cheap retained path can still
+    /// patch against it while honoring the post-input frame contract.
+    Semantic {
+        last_frame: Option<FrameData>,
+        force_send: bool,
+    },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
     TerminalAnsi { blit_encoder: BlitEncoder, seq: u64 },
 }
@@ -20,7 +26,10 @@ pub(crate) enum ClientRenderState {
 impl ClientRenderState {
     pub(crate) fn new(render_encoding: RenderEncoding) -> Self {
         match render_encoding {
-            RenderEncoding::SemanticFrame => Self::Semantic { last_frame: None },
+            RenderEncoding::SemanticFrame => Self::Semantic {
+                last_frame: None,
+                force_send: false,
+            },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
                 blit_encoder: BlitEncoder::new(),
                 seq: 0,
@@ -30,24 +39,55 @@ impl ClientRenderState {
 
     pub(crate) fn reset_baseline(&mut self) {
         match self {
-            Self::Semantic { last_frame } => *last_frame = None,
+            Self::Semantic { last_frame, .. } => *last_frame = None,
             Self::TerminalAnsi { blit_encoder, .. } => *blit_encoder = BlitEncoder::new(),
         }
     }
 
+    /// Guarantees the next rendered frame is sent even if it equals the
+    /// baseline, without dropping the baseline. Used after input so semantic /
+    /// remote clients always receive a post-input frame.
     pub(crate) fn reset_semantic_input_baseline(&mut self) {
-        if let Self::Semantic { last_frame } = self {
-            *last_frame = None;
+        if let Self::Semantic { force_send, .. } = self {
+            *force_send = true;
         }
+    }
+
+    pub(crate) fn semantic_force_send_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Semantic {
+                force_send: true,
+                ..
+            }
+        )
     }
 
     pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
         match self {
-            Self::Semantic { last_frame } => {
+            Self::Semantic {
+                last_frame,
+                force_send,
+            } => {
+                let force = std::mem::replace(force_send, false);
                 let message = match last_frame.as_ref() {
                     Some(prev) if prev == &frame => {
-                        crate::render_prof::event("prepare_frame.semantic.skip_current");
-                        return None;
+                        if force {
+                            // Post-input contract: deliver a frame even when the
+                            // content is unchanged. An empty diff is the minimal
+                            // frame the client can ack, and keeps the baseline so
+                            // later renders stay on the cheap diff path.
+                            crate::render_prof::event(
+                                "prepare_frame.semantic.force_send_unchanged",
+                            );
+                            let diff = frame
+                                .diff_from(prev)
+                                .expect("dimensions equal, diff must be Some");
+                            ServerMessage::FrameDiff(diff)
+                        } else {
+                            crate::render_prof::event("prepare_frame.semantic.skip_current");
+                            return None;
+                        }
                     }
                     // Same dimensions as the client's baseline: send only the
                     // rows that changed. The client patches its cached frame.
@@ -112,7 +152,7 @@ impl ClientRenderState {
 
     pub(crate) fn last_frame(&self) -> Option<&FrameData> {
         match self {
-            Self::Semantic { last_frame } => last_frame.as_ref(),
+            Self::Semantic { last_frame, .. } => last_frame.as_ref(),
             Self::TerminalAnsi { blit_encoder, .. } => blit_encoder.last_frame(),
         }
     }
@@ -121,7 +161,7 @@ impl ClientRenderState {
         match (self, prepared) {
             // The baseline is always the full new frame, regardless of whether a
             // full keyframe or a diff was sent on the wire.
-            (Self::Semantic { last_frame }, PreparedRender::Semantic { frame, .. }) => {
+            (Self::Semantic { last_frame, .. }, PreparedRender::Semantic { frame, .. }) => {
                 *last_frame = Some(frame)
             }
             (

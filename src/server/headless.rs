@@ -3058,7 +3058,11 @@ impl HeadlessServer {
         );
         let cursor_changed = frame.cursor != previous_cursor;
 
-        if !touched && !cursor_changed {
+        // Honor the post-input frame contract: if a forced send is pending, the
+        // client must receive a frame even when nothing visible changed, so we
+        // fall through to the send path (which emits a minimal diff) instead of
+        // short-circuiting.
+        if !touched && !cursor_changed && !client.render_state.semantic_force_send_pending() {
             retained_success!("clean_no_cursor_change");
         }
 
@@ -6642,6 +6646,35 @@ next_tab = ""
         assert!(
             !client.graphics_surface_reset_pending,
             "focus-gained must not reset the graphics surface (no image retransmit)"
+        );
+    }
+
+    // Contract: a semantic client must receive a frame after input even when the
+    // rendered frame is identical to the previous one (IME/remote responsiveness
+    // relies on the post-input frame). This must hold regardless of how the
+    // input render path is optimized.
+    #[tokio::test]
+    async fn semantic_client_receives_frame_after_input_even_when_unchanged() {
+        let (mut server, client_rx, _pane_id) = retained_test_server(b"hello");
+
+        server.render_and_stream();
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial semantic frame establishes the baseline");
+
+        // What handle_client_input_events does for app-client input.
+        server
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .request_semantic_redraw_after_input();
+
+        // Re-render with no content change.
+        server.render_and_stream();
+
+        assert!(
+            client_rx.recv_timeout(Duration::from_millis(100)).is_ok(),
+            "semantic client must receive a post-input frame even when content is unchanged"
         );
     }
 
