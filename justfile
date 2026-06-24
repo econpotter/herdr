@@ -41,6 +41,32 @@ install-hooks:
 build:
     cargo build --release --locked
 
+# Runs in a dedicated `profile` herdr session (HERDR_SESSION=profile) so it gets
+# its own socket, data dir, and log and never collides with your normal running
+# herdr. Once per second the server logs a `render.prof` line (per-stage avg/max
+# us, changed cells, encoded bytes) to that session's herdr-server.log. Builds
+# release so the timings are realistic. Extra args are forwarded to herdr, e.g.
+# `just profile` (TUI) or `just profile server`. If your zig binary is not named
+# `zig`, set ZIG, e.g. `ZIG=zig0.15 just profile`.
+# Start herdr with render profiling on, isolated in a `profile` session
+profile *args:
+    env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH \
+        HERDR_SESSION=profile HERDR_RENDER_PROF=1 \
+        cargo run --release --locked -- {{args}}
+
+# Run in a second terminal while `just profile` is up and exercise a busy pane.
+# Tail render.prof lines from the `profile` session's server log
+profile-log:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    log="${XDG_CONFIG_HOME:-$HOME/.config}/herdr/sessions/profile/herdr-server.log"
+    if [[ ! -f "$log" ]]; then
+        echo "no $log yet — run 'just profile' first" >&2
+        exit 1
+    fi
+    echo "tailing render.prof from $log (Ctrl-C to stop)"
+    tail -n 0 -f "$log" | grep --line-buffered render.prof
+
 # Build the website and documentation
 website-build:
     cd website && bun install --frozen-lockfile && bun run build
