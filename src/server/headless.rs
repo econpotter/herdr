@@ -246,6 +246,9 @@ pub struct HeadlessServer {
     /// Pooled virtual renderer reused across full App-client frames to avoid
     /// per-frame screen-sized buffer allocation.
     virtual_renderer: crate::server::render_stream::VirtualRenderer,
+    /// Pooled sidebar renderer reused across spinner-tick retained sidebar
+    /// updates to avoid per-tick screen-sized buffer allocation and clone.
+    sidebar_renderer: crate::server::render_stream::SidebarRenderer,
 }
 
 fn apply_terminal_attach_scroll(
@@ -432,6 +435,7 @@ impl HeadlessServer {
             server_event_rx,
             server_event_tx,
             virtual_renderer: crate::server::render_stream::VirtualRenderer::new(),
+            sidebar_renderer: crate::server::render_stream::SidebarRenderer::new(),
         })
     }
 
@@ -3078,11 +3082,9 @@ impl HeadlessServer {
         }
 
         let area = Rect::new(0, 0, *cols, *rows);
-        let buffer = crate::server::render_stream::render_sidebar_region(
-            &mut self.app.state,
-            &self.app.terminal_runtimes,
-            area,
-        );
+        let buffer =
+            self.sidebar_renderer
+                .render(&mut self.app.state, &self.app.terminal_runtimes, area);
 
         let mut patch_rows = Vec::with_capacity(usize::from(sidebar_rect.height));
         for local_y in 0..sidebar_rect.height {
@@ -4094,6 +4096,7 @@ mod tests {
             server_event_rx,
             server_event_tx,
             virtual_renderer: crate::server::render_stream::VirtualRenderer::new(),
+            sidebar_renderer: crate::server::render_stream::SidebarRenderer::new(),
         }
     }
 

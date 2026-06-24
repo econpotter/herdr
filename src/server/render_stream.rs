@@ -380,16 +380,7 @@ impl VirtualRenderer {
         width: u16,
         height: u16,
     ) -> &mut ratatui::Terminal<CursorTrackingBackend> {
-        let fits = self.terminal.as_ref().is_some_and(|terminal| {
-            let area = terminal.backend().buffer().area;
-            area.width == width && area.height == height
-        });
-        if !fits {
-            let backend = CursorTrackingBackend::new(width, height);
-            self.terminal =
-                Some(ratatui::Terminal::new(backend).expect("TestBackend::new should never fail"));
-        }
-        self.terminal.as_mut().expect("terminal initialized above")
+        pooled_terminal(&mut self.terminal, width, height)
     }
 
     /// Renders the full App UI into the pooled terminal and returns the frame to
@@ -454,29 +445,67 @@ impl VirtualRenderer {
     }
 }
 
+/// Returns the pooled terminal in `slot` sized to `width`x`height`, allocating
+/// or resizing it only when the dimensions change. Shared by `VirtualRenderer`
+/// and `SidebarRenderer` so both reuse one backend across renders instead of
+/// allocating a fresh full-screen buffer per frame.
+fn pooled_terminal(
+    slot: &mut Option<ratatui::Terminal<CursorTrackingBackend>>,
+    width: u16,
+    height: u16,
+) -> &mut ratatui::Terminal<CursorTrackingBackend> {
+    let fits = slot.as_ref().is_some_and(|terminal| {
+        let area = terminal.backend().buffer().area;
+        area.width == width && area.height == height
+    });
+    if !fits {
+        let backend = CursorTrackingBackend::new(width, height);
+        *slot = Some(ratatui::Terminal::new(backend).expect("TestBackend::new should never fail"));
+    }
+    slot.as_mut().expect("terminal initialized above")
+}
+
 /// Renders only the desktop sidebar into a full-size buffer, leaving pane and
 /// other regions blank. The headless sidebar-only retained path copies the
-/// `sidebar_rect` cells out of this buffer into the cached frame, avoiding the
-/// expensive full pane redraw when the spinner animation is the only change.
-pub(crate) fn render_sidebar_region(
-    app_state: &mut AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-    area: Rect,
-) -> ratatui::buffer::Buffer {
-    // Refresh geometry (sidebar_rect, layout) without resizing panes, matching
-    // the geometry pass of a full render so the patched cells are identical.
-    crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
+/// `sidebar_rect` cells out of the rendered buffer into the cached frame,
+/// avoiding the expensive full pane redraw when the spinner animation is the
+/// only change.
+///
+/// The backend terminal is pooled across renders. Only the `sidebar_rect` cells
+/// are ever read by callers, so stale content left in the pooled buffer outside
+/// the sidebar columns is irrelevant — the sidebar columns are fully redrawn
+/// every call (same reasoning as `VirtualRenderer`).
+pub(crate) struct SidebarRenderer {
+    terminal: Option<ratatui::Terminal<CursorTrackingBackend>>,
+}
 
-    let backend = CursorTrackingBackend::new(area.width, area.height);
-    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+impl SidebarRenderer {
+    pub(crate) fn new() -> Self {
+        Self { terminal: None }
+    }
 
-    terminal
-        .draw(|frame| {
-            crate::ui::render_sidebar_chrome_only(app_state, terminal_runtimes, frame);
-        })
-        .expect("render to TestBackend should never fail");
+    /// Renders the sidebar chrome into the pooled terminal and returns the
+    /// borrowed backend buffer, avoiding the per-frame buffer clone.
+    pub(crate) fn render(
+        &mut self,
+        app_state: &mut AppState,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        area: Rect,
+    ) -> &ratatui::buffer::Buffer {
+        // Refresh geometry (sidebar_rect, layout) without resizing panes,
+        // matching the geometry pass of a full render so the patched cells are
+        // identical.
+        crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
 
-    terminal.backend().buffer().clone()
+        let terminal = pooled_terminal(&mut self.terminal, area.width, area.height);
+        terminal
+            .draw(|frame| {
+                crate::ui::render_sidebar_chrome_only(app_state, terminal_runtimes, frame);
+            })
+            .expect("render to TestBackend should never fail");
+
+        terminal.backend().buffer()
+    }
 }
 
 /// Renders one server-owned terminal directly for `terminal attach` clients.
@@ -713,9 +742,10 @@ mod sidebar_retained_tests {
     /// `sidebar_rect` cells of `base` from a freshly rendered sidebar buffer.
     fn patch_sidebar(base: &FrameData, app: &mut AppState, area: Rect) -> FrameData {
         let registry = TerminalRuntimeRegistry::new();
-        let buffer = render_sidebar_region(app, &registry, area);
+        let mut renderer = SidebarRenderer::new();
+        let buffer = renderer.render(app, &registry, area);
+        let sidebar_full = FrameData::from_ratatui_buffer(buffer, None);
         let sidebar = app.view.sidebar_rect;
-        let sidebar_full = FrameData::from_ratatui_buffer(&buffer, None);
         let mut patched = base.clone();
         let width = usize::from(patched.width);
         for local_y in 0..sidebar.height {
