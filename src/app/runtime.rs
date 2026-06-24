@@ -354,10 +354,19 @@ impl App {
     }
 
     fn agent_panel_has_animation(&self) -> bool {
-        self.state
-            .workspaces
-            .iter()
-            .any(|ws| ws.has_working_pane(&self.state.terminals))
+        // Agent state icons are static dots (color carries the state), so no
+        // panel currently animates and the animation timer stays dormant. The
+        // timer + spinner-tick + retained-sidebar plumbing is kept intact; flip
+        // AGENT_PANEL_ANIMATED to true to re-engage it for a future animated
+        // indicator. The short-circuit keeps `has_working_pane` referenced so
+        // the plumbing does not bitrot.
+        const AGENT_PANEL_ANIMATED: bool = false;
+        AGENT_PANEL_ANIMATED
+            && self
+                .state
+                .workspaces
+                .iter()
+                .any(|ws| ws.has_working_pane(&self.state.terminals))
     }
 
     pub(crate) fn tick_selection_autoscroll(&mut self, now: Instant) {

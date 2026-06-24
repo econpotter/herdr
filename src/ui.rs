@@ -93,15 +93,6 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
-// Braille spinner frames — smooth rotation
-const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Map spinner_tick (incremented every frame at ~60fps) to a spinner frame.
-/// We want ~8 updates/sec so divide by 8.
-pub(super) fn spinner_frame(tick: u32) -> &'static str {
-    SPINNERS[(tick as usize / 8) % SPINNERS.len()]
-}
-
 /// Compute view geometry and reconcile pane sizes.
 /// Called before render to separate mutation from drawing.
 #[cfg_attr(not(test), allow(dead_code))]

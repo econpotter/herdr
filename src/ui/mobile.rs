@@ -282,14 +282,8 @@ fn render_header_status(
     };
 
     let (state, seen) = ws.aggregate_state(&app.terminals);
-    let (dot, dot_style) = if matches!(state, AgentState::Working) {
-        (
-            super::spinner_frame(app.spinner_tick),
-            Style::default().fg(p.yellow),
-        )
-    } else {
-        state_dot(state, seen, p)
-    };
+    // Working renders the same static yellow dot as state_dot; no spinner.
+    let (dot, dot_style) = state_dot(state, seen, p);
     let tab_label = mobile_tab_status(ws);
     let row1 = Rect::new(area.x, area.y, area.width, 1);
     let tab_w = (tab_label.chars().count() as u16 + 1).min(area.width);
@@ -576,7 +570,7 @@ fn render_mobile_switcher_content(
             entry.ws_idx == ws_idx && entry.tab_idx == tab_idx && entry.pane_id == pane_id
         });
         let bg = mobile_item_bg(false, active, p);
-        let (icon, icon_style) = agent_icon(entry.state, entry.seen, app.spinner_tick, p);
+        let (icon, icon_style) = agent_icon(entry.state, entry.seen, p);
         let title = Line::from(vec![
             Span::styled("  ", Style::default().bg(bg)),
             Span::styled(icon, icon_style.bg(bg)),

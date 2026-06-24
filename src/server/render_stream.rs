@@ -704,7 +704,7 @@ mod sidebar_retained_tests {
     use crate::workspace::Workspace;
 
     /// Builds an app with two workspaces whose agents are in the Working state,
-    /// so the sidebar renders an animated spinner driven by `spinner_tick`.
+    /// so the sidebar renders their (static) agent-state dots.
     fn working_agent_app() -> AppState {
         let mut app = AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
@@ -720,8 +720,9 @@ mod sidebar_retained_tests {
         }
         app.active = Some(0);
         app.selected = 0;
-        // Terminal mode: no navigate/overlay drawing, so the spinner only affects
-        // the sidebar region — the precondition for the retained sidebar path.
+        // Terminal mode: no navigate/overlay drawing, so an agent-state change
+        // only affects the sidebar region — the precondition for the retained
+        // sidebar path.
         app.mode = Mode::Terminal;
         app
     }
@@ -772,22 +773,27 @@ mod sidebar_retained_tests {
     }
 
     #[test]
-    fn sidebar_patch_matches_full_render_after_spinner_tick() {
+    fn sidebar_patch_matches_full_render_after_agent_state_change() {
         let area = Rect::new(0, 0, 100, 30);
         let mut app = working_agent_app();
         let frame0 = full_frame(&mut app, area);
         let sidebar = app.view.sidebar_rect;
 
-        // Advance the spinner exactly as the headless scheduled-task pass does.
-        app.spinner_tick = app
-            .spinner_tick
-            .wrapping_add(crate::app::HEADLESS_ANIMATION_TICK_STEP);
+        // Drive a sidebar-confined change the way the retained path is meant to
+        // handle it: flip the non-focused workspace's agent state (its sidebar
+        // dot color changes; the focused pane content does not).
+        let pane = app.workspaces[1].tabs[0].root_pane;
+        let terminal_id = app.workspaces[1].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Idle;
         let frame1 = full_frame(&mut app, area);
 
-        // The tick must actually change the rendered output, or the test is vacuous.
+        // The state change must actually change the rendered output, or the
+        // test is vacuous.
         assert_ne!(
             frame0.cells, frame1.cells,
-            "spinner tick should change the rendered sidebar"
+            "agent state change should change the rendered sidebar"
         );
 
         // And every change must be confined to the sidebar region.
@@ -804,7 +810,7 @@ mod sidebar_retained_tests {
                 let idx = usize::from(y) * width + usize::from(x);
                 assert_eq!(
                     frame0.cells[idx], frame1.cells[idx],
-                    "spinner tick changed a cell outside the sidebar at ({x}, {y})"
+                    "agent state change altered a cell outside the sidebar at ({x}, {y})"
                 );
             }
         }
@@ -1022,9 +1028,11 @@ mod pooled_render_tests {
         assert_eq!(pooled2, fresh2, "reused pooled render must match fresh");
 
         // Render after a change: pooled must reflect it and still match fresh.
-        app.spinner_tick = app
-            .spinner_tick
-            .wrapping_add(crate::app::HEADLESS_ANIMATION_TICK_STEP);
+        let pane = app.workspaces[1].tabs[0].root_pane;
+        let terminal_id = app.workspaces[1].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Idle;
         let fresh3 = fresh_frame(&mut app, &rt, area);
         let pooled3 = pooled.render_app_frame(&mut app, &rt, area, true, cell);
         assert_eq!(

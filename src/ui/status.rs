@@ -200,15 +200,11 @@ pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static
     }
 }
 
-pub(super) fn agent_icon(
-    state: AgentState,
-    seen: bool,
-    tick: u32,
-    p: &Palette,
-) -> (&'static str, Style) {
+pub(super) fn agent_icon(state: AgentState, seen: bool, p: &Palette) -> (&'static str, Style) {
     match (state, seen) {
         (AgentState::Blocked, _) => ("◉", Style::default().fg(p.red)),
-        (AgentState::Working, _) => (super::spinner_frame(tick), Style::default().fg(p.yellow)),
+        // Static dot: color carries the working state; no animation timer needed.
+        (AgentState::Working, _) => ("●", Style::default().fg(p.yellow)),
         (AgentState::Idle, false) => ("●", Style::default().fg(p.teal)),
         (AgentState::Idle, true) => ("✓", Style::default().fg(p.green)),
         (AgentState::Unknown, _) => ("○", Style::default().fg(p.overlay0)),

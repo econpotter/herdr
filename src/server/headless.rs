@@ -5030,8 +5030,9 @@ next_tab = ""
             }));
     }
 
-    /// Arms a working-agent pane so the spinner animation timer engages, and
-    /// schedules the animation tick in the past so the next scheduled pass ticks.
+    /// Sets up a working-agent pane and pre-arms the animation deadline in the
+    /// past. The animation subsystem is currently dormant (icons are static),
+    /// so the scheduled pass disarms it rather than ticking.
     fn arm_spinner_tick(server: &mut HeadlessServer, now: Instant) {
         let workspace = crate::workspace::Workspace::test_new("anim");
         let pane_id = workspace.tabs[0].root_pane;
@@ -5053,20 +5054,26 @@ next_tab = ""
     }
 
     #[test]
-    fn scheduled_animation_only_flag_set_for_spinner_only_tick() {
+    fn animation_timer_stays_dormant_with_working_pane() {
         let mut server = test_headless_server();
         let now = Instant::now();
         arm_spinner_tick(&mut server, now);
 
+        // Dormant: even with a working pane and a due animation deadline, the
+        // scheduled pass disarms the timer and never advances the spinner.
         let before = server.app.state.spinner_tick;
-        assert!(server.handle_scheduled_tasks_headless(now, false));
-        assert_ne!(
+        server.handle_scheduled_tasks_headless(now, false);
+        assert_eq!(
             server.app.state.spinner_tick, before,
-            "spinner tick should advance"
+            "spinner must stay frozen while the animation subsystem is dormant"
+        );
+        assert_eq!(
+            server.app.next_animation_tick, None,
+            "the animation timer must be disarmed while dormant"
         );
         assert!(
-            server.app.last_scheduled_change_animation_only,
-            "spinner-only tick should be eligible for the sidebar retained path"
+            !server.app.last_scheduled_change_animation_only,
+            "no spinner-only tick can occur while dormant"
         );
     }
 
