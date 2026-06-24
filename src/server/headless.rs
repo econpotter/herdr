@@ -697,18 +697,22 @@ impl HeadlessServer {
                     if self.handle_internal_event_with_forwarding(ev) {
                         needs_render = true;
                         needs_full_render = true;
+                        crate::render_prof::event("full_render_cause.select_internal");
                     }
                 }
                 LoopEvent::Api(msg) => {
                     if self.handle_api_request_with_shutdown_check(*msg) {
                         needs_render = true;
                         needs_full_render = true;
+                        crate::render_prof::event("full_render_cause.select_api");
                     }
                 }
                 LoopEvent::ServerEvent(ev) => {
+                    let cause = Self::server_event_render_cause(&ev);
                     if self.handle_server_event(ev) {
                         needs_render = true;
                         needs_full_render = true;
+                        crate::render_prof::event(cause);
                     }
                 }
                 LoopEvent::RenderRequested => {
@@ -1328,7 +1332,11 @@ impl HeadlessServer {
     fn drain_server_events(&mut self) -> bool {
         let mut changed = false;
         while let Ok(ev) = self.server_event_rx.try_recv() {
-            changed |= self.handle_server_event(ev);
+            let cause = Self::server_event_render_cause(&ev);
+            if self.handle_server_event(ev) {
+                changed = true;
+                crate::render_prof::event(cause);
+            }
         }
         changed
     }
@@ -2281,6 +2289,38 @@ impl HeadlessServer {
             false
         } else {
             foreground_changed || theme_changed || interaction
+        }
+    }
+
+    /// Profiler attribution: which `ServerEvent` variant forced a render. Used
+    /// to break down what drives full renders in `HERDR_RENDER_PROF` windows.
+    fn server_event_render_cause(ev: &ServerEvent) -> &'static str {
+        match ev {
+            ServerEvent::ClientConnected { .. } => {
+                "full_render_cause.server_event.client_connected"
+            }
+            ServerEvent::ClientInput { .. } => "full_render_cause.server_event.client_input",
+            ServerEvent::ClientInputEvents { .. } => {
+                "full_render_cause.server_event.client_input_events"
+            }
+            ServerEvent::ClientClipboardImage { .. } => {
+                "full_render_cause.server_event.client_clipboard_image"
+            }
+            ServerEvent::ClientAttachTerminal { .. } => {
+                "full_render_cause.server_event.client_attach_terminal"
+            }
+            ServerEvent::ClientAttachScroll { .. } => {
+                "full_render_cause.server_event.client_attach_scroll"
+            }
+            ServerEvent::ClientResize { .. } => "full_render_cause.server_event.client_resize",
+            ServerEvent::ClientDetach { .. } => "full_render_cause.server_event.client_detach",
+            ServerEvent::ClientDisconnected { .. } => {
+                "full_render_cause.server_event.client_disconnected"
+            }
+            ServerEvent::ClientWriterDrained { .. } => {
+                "full_render_cause.server_event.client_writer_drained"
+            }
+            ServerEvent::QuitSignal => "full_render_cause.server_event.quit_signal",
         }
     }
 

@@ -728,8 +728,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
                         .public_pane_number(detail.pane_id)
                         .unwrap_or(detail_idx + 1);
                     let pane_style = Style::default().fg(p.overlay0);
-                    let (icon, icon_style) =
-                        agent_icon(detail.state, detail.seen, p);
+                    let (icon, icon_style) = agent_icon(detail.state, detail.seen, p);
                     frame.render_widget(
                         Paragraph::new(Line::from(vec![
                             Span::styled(format!("{pane_num}"), pane_style),
