@@ -373,6 +373,25 @@ pub fn render(app: &AppState, frame: &mut Frame) {
     render_with_runtime_registry(app, &terminal_runtimes, frame);
 }
 
+/// Draws only the desktop sidebar into `frame`, leaving the rest of the buffer
+/// untouched. Used by the headless server's sidebar-only retained render path,
+/// which patches just the sidebar region of the cached frame when the spinner
+/// animation is the only change. Callers must ensure the layout is not Mobile
+/// and no overlay mode is active (the spinner only renders inside the sidebar
+/// in that configuration).
+pub(crate) fn render_sidebar_chrome_only(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+) {
+    let sidebar_area = app.view.sidebar_rect;
+    if app.sidebar_collapsed {
+        render_sidebar_collapsed(app, frame, sidebar_area);
+    } else {
+        render_sidebar(app, terminal_runtimes, frame, sidebar_area);
+    }
+}
+
 pub fn render_with_runtime_registry(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,

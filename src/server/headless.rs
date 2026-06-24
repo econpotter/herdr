@@ -134,6 +134,19 @@ fn apply_terminal_dirty_patch(
     true
 }
 
+/// Converts a freshly-rendered ratatui cell into wire `CellData` for a retained
+/// patch. Sidebar cells never carry OSC 8 hyperlinks, so `hyperlink` is `None`.
+fn cell_data_from_ratatui_cell(cell: &ratatui::buffer::Cell) -> crate::protocol::CellData {
+    crate::protocol::CellData {
+        symbol: cell.symbol().into(),
+        fg: crate::protocol::color_to_u32(cell.fg),
+        bg: crate::protocol::color_to_u32(cell.bg),
+        modifier: crate::protocol::modifier_to_u16(cell.modifier),
+        skip: cell.skip,
+        hyperlink: None,
+    }
+}
+
 fn dirty_patch_intersects_hyperlinks(
     frame: &FrameData,
     area: Rect,
@@ -442,6 +455,10 @@ impl HeadlessServer {
 
         let mut needs_render = true;
         let mut needs_full_render = true;
+        // True when the only pending change is the spinner animation tick, which
+        // can be streamed via the cheap sidebar-only retained path instead of a
+        // full virtual render. Reset after every render.
+        let mut chrome_only = false;
 
         loop {
             crate::render_prof::event("loop.tick");
@@ -497,8 +514,13 @@ impl HeadlessServer {
             let now = Instant::now();
             if self.handle_scheduled_tasks_headless(now, needs_render) {
                 needs_render = true;
-                needs_full_render = true;
-                crate::render_prof::event("full_render_cause.scheduled_tasks");
+                if self.app.last_scheduled_change_animation_only && !needs_full_render {
+                    chrome_only = true;
+                    crate::render_prof::event("chrome_only_cause.scheduled_animation");
+                } else {
+                    needs_full_render = true;
+                    crate::render_prof::event("full_render_cause.scheduled_tasks");
+                }
             }
 
             // Handle deferred requests.
@@ -612,15 +634,23 @@ impl HeadlessServer {
                 } else if !pty_dirty {
                     crate::render_prof::event("retained_gate.not_pty_dirty");
                 }
-                let rendered_retained =
-                    pty_dirty && !needs_full_render && self.render_retained_pty_update_and_stream();
-                if !rendered_retained {
+                let rendered_retained = pty_dirty
+                    && !needs_full_render
+                    && !chrome_only
+                    && self.render_retained_pty_update_and_stream();
+                let rendered_sidebar = !rendered_retained
+                    && chrome_only
+                    && !needs_full_render
+                    && !pty_dirty
+                    && self.render_retained_sidebar_update_and_stream();
+                if !rendered_retained && !rendered_sidebar {
                     crate::render_prof::event("full_render.invoke");
                     self.render_and_stream();
                 }
                 self.app.last_render_at = Some(now);
                 needs_render = false;
                 needs_full_render = false;
+                chrome_only = false;
                 continue;
             }
 
@@ -2970,6 +3000,128 @@ impl HeadlessServer {
             && !self.app.full_redraw_pending
     }
 
+    /// Streams a spinner-only update by re-rendering just the sidebar into the
+    /// cached frame and sending the diff, avoiding the full pane redraw. Returns
+    /// `true` when the update was handled (including an identical-frame skip);
+    /// `false` falls back to a full render.
+    ///
+    /// Safe because in the allowed state (desktop layout, `Mode::Terminal`, no
+    /// overlay) the spinner animation only affects cells inside `sidebar_rect`,
+    /// so patching that region reproduces exactly what a full render would emit.
+    /// A toast is permitted: it renders over the terminal area, disjoint from
+    /// the sidebar, and cannot change on a pure animation tick.
+    fn render_retained_sidebar_update_and_stream(&mut self) -> bool {
+        crate::render_prof::event("retained_sidebar.attempt");
+        let retained_started = crate::render_prof::timer();
+        macro_rules! retained_fallback {
+            ($reason:literal) => {{
+                crate::render_prof::event(concat!("retained_sidebar_fallback.", $reason));
+                crate::render_prof::duration_since("retained_sidebar.total", retained_started);
+                return false;
+            }};
+        }
+        macro_rules! retained_success {
+            ($reason:literal) => {{
+                crate::render_prof::event("retained_sidebar.success");
+                crate::render_prof::event(concat!("retained_sidebar_success.", $reason));
+                crate::render_prof::duration_since("retained_sidebar.total", retained_started);
+                return true;
+            }};
+        }
+
+        if !self.retained_sidebar_update_allowed() {
+            retained_fallback!("unsafe_app_state");
+        }
+
+        let render_targets = render_targets(&self.clients, self.foreground_client_id);
+        let [(client_id, (cols, rows), _cell_size, _is_foreground, mode)] =
+            render_targets.as_slice()
+        else {
+            retained_fallback!("multiple_or_no_target");
+        };
+        if !matches!(mode, ClientConnectionMode::App) {
+            retained_fallback!("not_app_client");
+        }
+        let Some(client) = self.clients.get(client_id) else {
+            retained_fallback!("client_missing");
+        };
+        if client.render_pending {
+            retained_fallback!("render_pending");
+        }
+        // The sidebar carries no kitty graphics, but bail if graphics are active
+        // so the retained send never disturbs the client's graphics cache.
+        if self.app.state.kitty_graphics_enabled && !client.graphics_cache.is_empty() {
+            retained_fallback!("graphics_cache_active");
+        }
+        if client.graphics_surface_reset_pending {
+            retained_fallback!("graphics_surface_reset");
+        }
+
+        let Some(mut frame) = client.render_state.last_frame().cloned() else {
+            retained_fallback!("no_last_frame");
+        };
+        if frame.width != *cols || frame.height != *rows {
+            retained_fallback!("frame_size_mismatch");
+        }
+        frame.graphics.clear();
+
+        let sidebar_rect = self.app.state.view.sidebar_rect;
+        if sidebar_rect.width == 0 || sidebar_rect.height == 0 {
+            retained_fallback!("empty_sidebar");
+        }
+        if !rect_fits_frame(sidebar_rect, &frame) {
+            retained_fallback!("sidebar_outside_frame");
+        }
+
+        let area = Rect::new(0, 0, *cols, *rows);
+        let buffer = crate::server::render_stream::render_sidebar_region(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            area,
+        );
+
+        let mut patch_rows = Vec::with_capacity(usize::from(sidebar_rect.height));
+        for local_y in 0..sidebar_rect.height {
+            let y = sidebar_rect.y + local_y;
+            let mut row_cells = Vec::with_capacity(usize::from(sidebar_rect.width));
+            for local_x in 0..sidebar_rect.width {
+                let x = sidebar_rect.x + local_x;
+                let Some(cell) = buffer.cell((x, y)) else {
+                    retained_fallback!("buffer_cell_missing");
+                };
+                row_cells.push(cell_data_from_ratatui_cell(cell));
+            }
+            patch_rows.push((local_y, row_cells));
+        }
+        let patch = crate::pane::TerminalDirtyPatch { rows: patch_rows };
+        if dirty_patch_intersects_hyperlinks(&frame, sidebar_rect, &patch) {
+            retained_fallback!("hyperlink_intersection");
+        }
+        if !apply_terminal_dirty_patch(&mut frame, sidebar_rect, patch) {
+            retained_fallback!("patch_apply_failed");
+        }
+
+        // Cursor stays as-is: the spinner never moves the focused-terminal cursor.
+        let mut broken_clients = Vec::new();
+        let sent = self.send_retained_frame_to_client(*client_id, frame, &mut broken_clients);
+        for broken_client in broken_clients {
+            self.remove_client_and_resize_if_needed(broken_client);
+        }
+        if sent {
+            retained_success!("sent");
+        }
+        retained_fallback!("send_failed");
+    }
+
+    fn retained_sidebar_update_allowed(&self) -> bool {
+        self.app.state.mode == app::Mode::Terminal
+            && self.app.state.view.layout != crate::app::state::ViewLayout::Mobile
+            && self.app.state.selection.is_none()
+            && self.app.state.copy_mode.is_none()
+            && self.app.state.context_menu.is_none()
+            && !self.app.full_redraw_pending
+    }
+
     fn send_retained_frame_to_client(
         &mut self,
         client_id: u64,
@@ -3333,6 +3485,11 @@ impl HeadlessServer {
     /// (the server doesn't have a terminal to resize).
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
+        // Track whether the spinner ticked and whether anything *other* than the
+        // spinner changed, so the render loop can take the cheap sidebar-only
+        // retained path when the spinner is the sole change this iteration.
+        let mut animation_ticked = false;
+        let mut other_change = false;
 
         self.app.sync_headless_animation_timer(now);
 
@@ -3347,6 +3504,7 @@ impl HeadlessServer {
             self.app.config_diagnostic_deadline = None;
             self.app.state.config_diagnostic = None;
             changed = true;
+            other_change = true;
         }
 
         if self
@@ -3357,6 +3515,7 @@ impl HeadlessServer {
             self.app.toast_deadline = None;
             self.app.state.toast = None;
             changed = true;
+            other_change = true;
         }
 
         if self
@@ -3375,6 +3534,7 @@ impl HeadlessServer {
                     self.forward_agent_notification_delivery(delivery);
                 }
                 changed = true;
+                other_change = true;
             }
         }
 
@@ -3386,6 +3546,7 @@ impl HeadlessServer {
             self.app.copy_feedback_deadline = None;
             self.app.state.copy_feedback = None;
             changed = true;
+            other_change = true;
         }
 
         if self
@@ -3400,6 +3561,7 @@ impl HeadlessServer {
                 .wrapping_add(app::HEADLESS_ANIMATION_TICK_STEP);
             self.app.next_animation_tick = Some(now + app::HEADLESS_ANIMATION_INTERVAL);
             changed = true;
+            animation_ticked = true;
         }
 
         if self
@@ -3409,9 +3571,13 @@ impl HeadlessServer {
         {
             self.app.tick_selection_autoscroll(now);
             changed = true;
+            other_change = true;
         }
 
-        changed |= self.app.clear_due_selection_highlight(now);
+        if self.app.clear_due_selection_highlight(now) {
+            changed = true;
+            other_change = true;
+        }
 
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);
@@ -3454,17 +3620,23 @@ impl HeadlessServer {
             }
             self.app.sync_agent_metadata_deadline();
             changed = true;
+            other_change = true;
         }
 
         if geometry_dirty || self.foreground_client_id.is_none() {
             self.app.pending_agent_resume_deadline = None;
         } else {
             self.app.sync_pending_agent_resume_deadline(now);
-            changed |= self
+            if self
                 .app
-                .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
+                .start_pending_agent_resumes(self.app.pending_agent_resume_due(now))
+            {
+                changed = true;
+                other_change = true;
+            }
         }
         self.app.sync_headless_animation_timer(now);
+        self.app.last_scheduled_change_animation_only = animation_ticked && !other_change;
         changed
     }
 
@@ -4848,6 +5020,62 @@ next_tab = ""
                         } if custom_status.is_none()
                     )
             }));
+    }
+
+    /// Arms a working-agent pane so the spinner animation timer engages, and
+    /// schedules the animation tick in the past so the next scheduled pass ticks.
+    fn arm_spinner_tick(server: &mut HeadlessServer, now: Instant) {
+        let workspace = crate::workspace::Workspace::test_new("anim");
+        let pane_id = workspace.tabs[0].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        let terminal_id = server.app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane")
+            .attached_terminal_id
+            .clone();
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .state = crate::detect::AgentState::Working;
+        server.app.next_animation_tick = Some(now - Duration::from_millis(1));
+    }
+
+    #[test]
+    fn scheduled_animation_only_flag_set_for_spinner_only_tick() {
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        arm_spinner_tick(&mut server, now);
+
+        let before = server.app.state.spinner_tick;
+        assert!(server.handle_scheduled_tasks_headless(now, false));
+        assert_ne!(
+            server.app.state.spinner_tick, before,
+            "spinner tick should advance"
+        );
+        assert!(
+            server.app.last_scheduled_change_animation_only,
+            "spinner-only tick should be eligible for the sidebar retained path"
+        );
+    }
+
+    #[test]
+    fn scheduled_animation_flag_cleared_when_other_change_present() {
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        arm_spinner_tick(&mut server, now);
+        // A co-occurring non-spinner change (copy feedback expiry) must suppress
+        // the sidebar-only fast path so the full render runs.
+        server.app.copy_feedback_deadline = Some(now - Duration::from_millis(1));
+
+        assert!(server.handle_scheduled_tasks_headless(now, false));
+        assert!(
+            !server.app.last_scheduled_change_animation_only,
+            "a non-spinner change must force a full render"
+        );
     }
 
     #[test]

@@ -328,6 +328,31 @@ pub(crate) fn render_virtual_with_runtime_registry(
     (buffer, cursor)
 }
 
+/// Renders only the desktop sidebar into a full-size buffer, leaving pane and
+/// other regions blank. The headless sidebar-only retained path copies the
+/// `sidebar_rect` cells out of this buffer into the cached frame, avoiding the
+/// expensive full pane redraw when the spinner animation is the only change.
+pub(crate) fn render_sidebar_region(
+    app_state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+) -> ratatui::buffer::Buffer {
+    // Refresh geometry (sidebar_rect, layout) without resizing panes, matching
+    // the geometry pass of a full render so the patched cells are identical.
+    crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
+
+    let backend = CursorTrackingBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+
+    terminal
+        .draw(|frame| {
+            crate::ui::render_sidebar_chrome_only(app_state, terminal_runtimes, frame);
+        })
+        .expect("render to TestBackend should never fail");
+
+    terminal.backend().buffer().clone()
+}
+
 /// Renders one server-owned terminal directly for `terminal attach` clients.
 pub(crate) fn render_terminal_virtual(
     runtime: &crate::terminal::TerminalRuntime,
@@ -515,4 +540,124 @@ fn focused_terminal_suppresses_host_cursor(
     app_state
         .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         .is_some_and(crate::terminal::TerminalRuntime::synchronized_output_active)
+}
+
+#[cfg(test)]
+mod sidebar_retained_tests {
+    use super::*;
+    use crate::detect::{Agent, AgentState};
+    use crate::workspace::Workspace;
+
+    /// Builds an app with two workspaces whose agents are in the Working state,
+    /// so the sidebar renders an animated spinner driven by `spinner_tick`.
+    fn working_agent_app() -> AppState {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.ensure_test_terminals();
+        for ws_idx in 0..2 {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.detected_agent = Some(Agent::Claude);
+            terminal.state = AgentState::Working;
+        }
+        app.active = Some(0);
+        app.selected = 0;
+        // Terminal mode: no navigate/overlay drawing, so the spinner only affects
+        // the sidebar region — the precondition for the retained sidebar path.
+        app.mode = Mode::Terminal;
+        app
+    }
+
+    fn full_frame(app: &mut AppState, area: Rect) -> FrameData {
+        let registry = TerminalRuntimeRegistry::new();
+        let (buffer, cursor) = render_virtual_with_runtime_registry(
+            app,
+            &registry,
+            area,
+            true,
+            crate::kitty_graphics::HostCellSize::default(),
+        );
+        FrameData::from_ratatui_buffer(&buffer, cursor)
+    }
+
+    /// Produces what the sidebar-only retained path would: patch just the
+    /// `sidebar_rect` cells of `base` from a freshly rendered sidebar buffer.
+    fn patch_sidebar(base: &FrameData, app: &mut AppState, area: Rect) -> FrameData {
+        let registry = TerminalRuntimeRegistry::new();
+        let buffer = render_sidebar_region(app, &registry, area);
+        let sidebar = app.view.sidebar_rect;
+        let sidebar_full = FrameData::from_ratatui_buffer(&buffer, None);
+        let mut patched = base.clone();
+        let width = usize::from(patched.width);
+        for local_y in 0..sidebar.height {
+            let y = sidebar.y + local_y;
+            let start = usize::from(y) * width + usize::from(sidebar.x);
+            let end = start + usize::from(sidebar.width);
+            patched.cells[start..end].clone_from_slice(&sidebar_full.cells[start..end]);
+        }
+        patched
+    }
+
+    #[test]
+    fn sidebar_patch_reproduces_full_render_when_unchanged() {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut app = working_agent_app();
+        let frame = full_frame(&mut app, area);
+        assert!(app.view.sidebar_rect.width > 0 && app.view.sidebar_rect.height > 0);
+
+        let patched = patch_sidebar(&frame, &mut app, area);
+        assert_eq!(
+            patched.cells, frame.cells,
+            "patching the sidebar region with the same widget must reproduce the full frame"
+        );
+    }
+
+    #[test]
+    fn sidebar_patch_matches_full_render_after_spinner_tick() {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut app = working_agent_app();
+        let frame0 = full_frame(&mut app, area);
+        let sidebar = app.view.sidebar_rect;
+
+        // Advance the spinner exactly as the headless scheduled-task pass does.
+        app.spinner_tick = app
+            .spinner_tick
+            .wrapping_add(crate::app::HEADLESS_ANIMATION_TICK_STEP);
+        let frame1 = full_frame(&mut app, area);
+
+        // The tick must actually change the rendered output, or the test is vacuous.
+        assert_ne!(
+            frame0.cells, frame1.cells,
+            "spinner tick should change the rendered sidebar"
+        );
+
+        // And every change must be confined to the sidebar region.
+        let width = usize::from(frame0.width);
+        for y in 0..frame0.height {
+            for x in 0..frame0.width {
+                let in_sidebar = x >= sidebar.x
+                    && x < sidebar.x + sidebar.width
+                    && y >= sidebar.y
+                    && y < sidebar.y + sidebar.height;
+                if in_sidebar {
+                    continue;
+                }
+                let idx = usize::from(y) * width + usize::from(x);
+                assert_eq!(
+                    frame0.cells[idx], frame1.cells[idx],
+                    "spinner tick changed a cell outside the sidebar at ({x}, {y})"
+                );
+            }
+        }
+
+        // The retained path patches the cached frame0; it must equal a full t1 render.
+        let patched = patch_sidebar(&frame0, &mut app, area);
+        assert_eq!(
+            patched.cells, frame1.cells,
+            "sidebar-only patch of the cached frame must equal a full render after the tick"
+        );
+    }
 }

@@ -133,6 +133,11 @@ pub struct App {
     pub render_notify: Arc<Notify>,
     pub render_dirty: Arc<AtomicBool>,
     pub(crate) full_redraw_pending: bool,
+    /// Set by the headless scheduled-task pass: true when the only state change
+    /// this iteration was the spinner animation tick (no toast, metadata, or
+    /// other chrome change). Lets the render loop take the cheap sidebar-only
+    /// retained path instead of a full virtual render.
+    pub(crate) last_scheduled_change_animation_only: bool,
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
     pub(crate) config_reloaded_from_disk: bool,
@@ -724,6 +729,7 @@ impl App {
             render_notify,
             render_dirty,
             full_redraw_pending: false,
+            last_scheduled_change_animation_only: false,
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
             config_reloaded_from_disk: false,
