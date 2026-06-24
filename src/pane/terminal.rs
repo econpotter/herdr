@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use compact_str::CompactString;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::{layout::Rect, Frame};
 use serde::{Deserialize, Serialize};
@@ -1508,8 +1509,8 @@ fn ghostty_collect_dirty_patch(
                     &mut grapheme_codepoints,
                     &mut symbol_scratch,
                 ) {
-                    Ok(symbol) => symbol.to_owned(),
-                    Err(_) => ghostty_blank_symbol_for_width(basic.wide).to_owned(),
+                    Ok(symbol) => symbol.into(),
+                    Err(_) => ghostty_blank_symbol_for_width(basic.wide).into(),
                 };
                 patch_cells.push(cell_data_from_style(symbol, style));
                 x += 1;
@@ -1838,15 +1839,15 @@ fn ghostty_reset_cell(
 
 fn blank_cell_data(default_fg: Option<Color>, default_bg: Option<Color>) -> CellData {
     cell_data_from_style(
-        " ".to_string(),
+        CompactString::const_new(" "),
         ghostty_default_style(default_fg, default_bg),
     )
 }
 
-fn cell_data_from_style(symbol: String, style: Style) -> CellData {
+fn cell_data_from_style(symbol: CompactString, style: Style) -> CellData {
     CellData {
         symbol: if symbol.is_empty() {
-            " ".to_string()
+            CompactString::const_new(" ")
         } else {
             symbol
         },

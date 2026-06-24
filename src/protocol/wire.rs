@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
+use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -406,8 +407,10 @@ pub enum AttachScrollSource {
 /// `Cell` type to keep the wire protocol stable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellData {
-    /// Grapheme cluster displayed in this cell (usually 1–2 chars).
-    pub symbol: String,
+    /// Grapheme cluster displayed in this cell (usually 1–2 chars). Stored as a
+    /// `CompactString` so the common short-cluster case is inline (no per-cell
+    /// heap allocation). Serializes identically to a plain string on the wire.
+    pub symbol: CompactString,
     /// Foreground color as a packed u32 (0xAARRGGBB or ratatui Color index).
     pub fg: u32,
     /// Background color as a packed u32.
@@ -504,7 +507,7 @@ impl FrameData {
                         }))
                     });
                 cells.push(CellData {
-                    symbol: cell.symbol().to_owned(),
+                    symbol: cell.symbol().into(),
                     fg: color_to_u32(cell.fg),
                     bg: color_to_u32(cell.bg),
                     modifier: modifier_to_u16(cell.modifier),
@@ -1164,6 +1167,51 @@ mod tests {
         assert_eq!(msg, decoded);
     }
 
+    // Characterization: CellData's serialized wire shape must not change when its
+    // `symbol` field type changes. A shadow struct with the same field order but a
+    // plain `String` symbol must bincode-encode byte-identically to CellData for
+    // ASCII, multi-byte, and >24-byte ZWJ symbols. If this holds, no
+    // PROTOCOL_VERSION bump is needed for the String -> CompactString swap.
+    #[test]
+    fn cell_data_symbol_bincode_byte_identical() {
+        #[derive(serde::Serialize)]
+        struct CellDataShadow {
+            symbol: String,
+            fg: u32,
+            bg: u32,
+            modifier: u16,
+            skip: bool,
+            hyperlink: Option<u32>,
+        }
+
+        for sym in ["A", "→", "🦀", "👨‍👩‍👧‍👦"] {
+            let cell = CellData {
+                symbol: sym.into(),
+                fg: 0x02_FF_80_40,
+                bg: 0x01_00_00_AB,
+                modifier: 0x41,
+                skip: false,
+                hyperlink: Some(7),
+            };
+            let shadow = CellDataShadow {
+                symbol: sym.to_owned(),
+                fg: 0x02_FF_80_40,
+                bg: 0x01_00_00_AB,
+                modifier: 0x41,
+                skip: false,
+                hyperlink: Some(7),
+            };
+            let cell_bytes =
+                bincode::serde::encode_to_vec(&cell, bincode::config::standard()).unwrap();
+            let shadow_bytes =
+                bincode::serde::encode_to_vec(&shadow, bincode::config::standard()).unwrap();
+            assert_eq!(
+                cell_bytes, shadow_bytes,
+                "CellData wire shape diverged from String for symbol {sym:?}"
+            );
+        }
+    }
+
     #[test]
     fn server_frame_roundtrip_nontrivial() {
         // Build a 3×2 frame with varied styles (≥2×2).
@@ -1369,9 +1417,9 @@ mod tests {
         let cells: Vec<CellData> = (0..(width as usize) * (height as usize))
             .map(|i| CellData {
                 symbol: if i % 256 < 32 {
-                    " ".to_owned()
+                    " ".into()
                 } else {
-                    format!("{:03}", i % 1000)
+                    compact_str::format_compact!("{:03}", i % 1000)
                 },
                 fg: color_to_u32(Color::Rgb((i % 256) as u8, ((i / 256) % 256) as u8, 128)),
                 bg: color_to_u32(Color::Indexed((i % 256) as u8)),

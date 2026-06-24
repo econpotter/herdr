@@ -191,75 +191,101 @@ fn compute_prof_blit_stats(
 // Color → escape sequence
 // ---------------------------------------------------------------------------
 
-/// Converts a packed u32 color to an SGR escape sequence fragment.
-///
-/// Returns a string like `38;5;123` (indexed) or `38;2;255;128;64` (RGB)
-/// or `39` (reset), without the leading `\x1b[` or trailing `m`.
-fn color_to_sgr_fg(val: u32) -> String {
+/// Appends the base-10 ASCII digits of `n` (0–255, no leading zeros) to `out`.
+fn push_u8_dec(out: &mut Vec<u8>, n: u8) {
+    if n >= 100 {
+        out.push(b'0' + n / 100);
+    }
+    if n >= 10 {
+        out.push(b'0' + (n / 10) % 10);
+    }
+    out.push(b'0' + n % 10);
+}
+
+/// Appends the foreground SGR parameter fragment for a packed u32 color to
+/// `out` (e.g. `38;5;123` indexed, `38;2;255;128;64` RGB, `39` reset), without
+/// the leading `\x1b[` or trailing `m`.
+fn write_color_sgr_fg(out: &mut Vec<u8>, val: u32) {
     match val >> 24 {
-        0x00 => match val & 0xFF {
-            0x00 => "39".to_owned(), // Reset
-            0x01 => "30".to_owned(), // Black
-            0x02 => "31".to_owned(), // Red
-            0x03 => "32".to_owned(), // Green
-            0x04 => "33".to_owned(), // Yellow
-            0x05 => "34".to_owned(), // Blue
-            0x06 => "35".to_owned(), // Magenta
-            0x07 => "36".to_owned(), // Cyan
-            0x08 => "37".to_owned(), // Gray (light gray)
-            0x09 => "90".to_owned(), // DarkGray
-            0x0A => "91".to_owned(), // LightRed
-            0x0B => "92".to_owned(), // LightGreen
-            0x0C => "93".to_owned(), // LightYellow
-            0x0D => "94".to_owned(), // LightBlue
-            0x0E => "95".to_owned(), // LightMagenta
-            0x0F => "96".to_owned(), // LightCyan
-            0x10 => "97".to_owned(), // White
-            _ => "39".to_owned(),    // Unknown → Reset
-        },
-        0x01 => format!("38;5;{}", val & 0xFF), // Indexed
-        0x02 => {
-            // RGB
-            let r = (val >> 16) & 0xFF;
-            let g = (val >> 8) & 0xFF;
-            let b = val & 0xFF;
-            format!("38;2;{r};{g};{b}")
+        0x00 => {
+            let named: &[u8] = match val & 0xFF {
+                0x00 => b"39", // Reset
+                0x01 => b"30", // Black
+                0x02 => b"31", // Red
+                0x03 => b"32", // Green
+                0x04 => b"33", // Yellow
+                0x05 => b"34", // Blue
+                0x06 => b"35", // Magenta
+                0x07 => b"36", // Cyan
+                0x08 => b"37", // Gray (light gray)
+                0x09 => b"90", // DarkGray
+                0x0A => b"91", // LightRed
+                0x0B => b"92", // LightGreen
+                0x0C => b"93", // LightYellow
+                0x0D => b"94", // LightBlue
+                0x0E => b"95", // LightMagenta
+                0x0F => b"96", // LightCyan
+                0x10 => b"97", // White
+                _ => b"39",    // Unknown → Reset
+            };
+            out.extend_from_slice(named);
         }
-        _ => "39".to_owned(), // Unknown → Reset
+        0x01 => {
+            out.extend_from_slice(b"38;5;");
+            push_u8_dec(out, (val & 0xFF) as u8);
+        }
+        0x02 => {
+            out.extend_from_slice(b"38;2;");
+            push_u8_dec(out, (val >> 16) as u8);
+            out.push(b';');
+            push_u8_dec(out, (val >> 8) as u8);
+            out.push(b';');
+            push_u8_dec(out, val as u8);
+        }
+        _ => out.extend_from_slice(b"39"), // Unknown → Reset
     }
 }
 
-/// Converts a packed u32 color to a background SGR fragment.
-fn color_to_sgr_bg(val: u32) -> String {
+/// Appends the background SGR parameter fragment for a packed u32 color to
+/// `out`.
+fn write_color_sgr_bg(out: &mut Vec<u8>, val: u32) {
     match val >> 24 {
-        0x00 => match val & 0xFF {
-            0x00 => "49".to_owned(),  // Reset
-            0x01 => "40".to_owned(),  // Black
-            0x02 => "41".to_owned(),  // Red
-            0x03 => "42".to_owned(),  // Green
-            0x04 => "43".to_owned(),  // Yellow
-            0x05 => "44".to_owned(),  // Blue
-            0x06 => "45".to_owned(),  // Magenta
-            0x07 => "46".to_owned(),  // Cyan
-            0x08 => "47".to_owned(),  // Gray (light gray)
-            0x09 => "100".to_owned(), // DarkGray
-            0x0A => "101".to_owned(), // LightRed
-            0x0B => "102".to_owned(), // LightGreen
-            0x0C => "103".to_owned(), // LightYellow
-            0x0D => "104".to_owned(), // LightBlue
-            0x0E => "105".to_owned(), // LightMagenta
-            0x0F => "106".to_owned(), // LightCyan
-            0x10 => "107".to_owned(), // White
-            _ => "49".to_owned(),     // Unknown → Reset
-        },
-        0x01 => format!("48;5;{}", val & 0xFF), // Indexed
-        0x02 => {
-            let r = (val >> 16) & 0xFF;
-            let g = (val >> 8) & 0xFF;
-            let b = val & 0xFF;
-            format!("48;2;{r};{g};{b}")
+        0x00 => {
+            let named: &[u8] = match val & 0xFF {
+                0x00 => b"49",  // Reset
+                0x01 => b"40",  // Black
+                0x02 => b"41",  // Red
+                0x03 => b"42",  // Green
+                0x04 => b"43",  // Yellow
+                0x05 => b"44",  // Blue
+                0x06 => b"45",  // Magenta
+                0x07 => b"46",  // Cyan
+                0x08 => b"47",  // Gray (light gray)
+                0x09 => b"100", // DarkGray
+                0x0A => b"101", // LightRed
+                0x0B => b"102", // LightGreen
+                0x0C => b"103", // LightYellow
+                0x0D => b"104", // LightBlue
+                0x0E => b"105", // LightMagenta
+                0x0F => b"106", // LightCyan
+                0x10 => b"107", // White
+                _ => b"49",     // Unknown → Reset
+            };
+            out.extend_from_slice(named);
         }
-        _ => "49".to_owned(),
+        0x01 => {
+            out.extend_from_slice(b"48;5;");
+            push_u8_dec(out, (val & 0xFF) as u8);
+        }
+        0x02 => {
+            out.extend_from_slice(b"48;2;");
+            push_u8_dec(out, (val >> 16) as u8);
+            out.push(b';');
+            push_u8_dec(out, (val >> 8) as u8);
+            out.push(b';');
+            push_u8_dec(out, val as u8);
+        }
+        _ => out.extend_from_slice(b"49"),
     }
 }
 
@@ -267,65 +293,37 @@ fn color_to_sgr_bg(val: u32) -> String {
 // Modifier → SGR
 // ---------------------------------------------------------------------------
 
-/// Converts a u16 modifier bitmask to SGR escape sequence fragments.
+/// ratatui::Modifier bits (from bitflags), in the fixed emission order, paired
+/// with their `;<param>` SGR fragment.
+const MODIFIER_SGR_PARTS: [(u16, &[u8]); 9] = [
+    (1 << 0, b";1"), // BOLD
+    (1 << 1, b";2"), // DIM
+    (1 << 2, b";3"), // ITALIC
+    (1 << 3, b";4"), // UNDERLINED
+    (1 << 4, b";5"), // SLOW_BLINK
+    (1 << 5, b";6"), // RAPID_BLINK
+    (1 << 6, b";7"), // REVERSED
+    (1 << 7, b";8"), // HIDDEN
+    (1 << 8, b";9"), // CROSSED_OUT
+];
+
+/// Appends a complete SGR escape sequence for a cell's style to `out`.
 ///
-/// Returns a Vec of SGR parameter strings (e.g., "1" for bold, "3" for italic).
-fn modifier_to_sgr_parts(val: u16) -> Vec<&'static str> {
-    let mut parts = Vec::new();
-
-    // ratatui::Modifier bits (from bitflags)
-    const BOLD: u16 = 1 << 0; // 0x01
-    const DIM: u16 = 1 << 1; // 0x02
-    const ITALIC: u16 = 1 << 2; // 0x04
-    const UNDERLINED: u16 = 1 << 3; // 0x08
-    const SLOW_BLINK: u16 = 1 << 4; // 0x10
-    const RAPID_BLINK: u16 = 1 << 5; // 0x20
-    const REVERSED: u16 = 1 << 6; // 0x40
-    const HIDDEN: u16 = 1 << 7; // 0x80
-    const CROSSED_OUT: u16 = 1 << 8; // 0x100
-
-    if val & BOLD != 0 {
-        parts.push("1");
+/// Layout: `\x1b[` `0` (reset) then each set modifier in bitmask order, then the
+/// fg fragment, then the bg fragment, separated by `;`, terminated by `m`. This
+/// writes bytes directly into the caller's buffer with no per-cell allocation.
+fn build_sgr_into(out: &mut Vec<u8>, fg: u32, bg: u32, modifier: u16) {
+    out.extend_from_slice(b"\x1b[0");
+    for (bit, seq) in MODIFIER_SGR_PARTS {
+        if modifier & bit != 0 {
+            out.extend_from_slice(seq);
+        }
     }
-    if val & DIM != 0 {
-        parts.push("2");
-    }
-    if val & ITALIC != 0 {
-        parts.push("3");
-    }
-    if val & UNDERLINED != 0 {
-        parts.push("4");
-    }
-    if val & SLOW_BLINK != 0 {
-        parts.push("5");
-    }
-    if val & RAPID_BLINK != 0 {
-        parts.push("6");
-    }
-    if val & REVERSED != 0 {
-        parts.push("7");
-    }
-    if val & HIDDEN != 0 {
-        parts.push("8");
-    }
-    if val & CROSSED_OUT != 0 {
-        parts.push("9");
-    }
-
-    parts
-}
-
-/// Builds a complete SGR escape sequence for a cell's style.
-fn build_sgr(fg: u32, bg: u32, modifier: u16) -> String {
-    let mut parts = vec!["0".to_owned()];
-    parts.extend(
-        modifier_to_sgr_parts(modifier)
-            .into_iter()
-            .map(str::to_owned),
-    );
-    parts.push(color_to_sgr_fg(fg));
-    parts.push(color_to_sgr_bg(bg));
-    format!("\x1b[{}m", parts.join(";"))
+    out.push(b';');
+    write_color_sgr_fg(out, fg);
+    out.push(b';');
+    write_color_sgr_bg(out, bg);
+    out.push(b'm');
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +553,8 @@ fn write_ime_anchor_cursor_state(writer: &mut impl Write, cursor: HostCursorStat
 
 fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
     let mut active_hyperlink = None;
+    // Reused across all cells; one allocation per frame instead of per cell.
+    let mut sgr_buf = Vec::new();
     for row in 0..frame.height {
         let mut to_skip = 0usize;
         for col in 0..frame.width {
@@ -574,8 +574,9 @@ fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
             let _ = write!(writer, "\x1b[{};{}H", row + 1, col + 1);
 
             // Set style.
-            let sgr = build_sgr(cell.fg, cell.bg, cell.modifier);
-            let _ = writer.write_all(sgr.as_bytes());
+            sgr_buf.clear();
+            build_sgr_into(&mut sgr_buf, cell.fg, cell.bg, cell.modifier);
+            let _ = writer.write_all(&sgr_buf);
 
             write_hyperlink_if_changed(
                 writer,
@@ -649,12 +650,14 @@ fn close_hyperlink(writer: &mut impl Write, active: &mut Option<String>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // cohesive cell-write state; splitting would obscure it
 fn write_cell(
     writer: &mut impl Write,
     row: u16,
     col: u16,
     cell: &CellData,
-    last_sgr: &mut String,
+    last_style: &mut Option<(u32, u32, u16)>,
+    sgr_buf: &mut Vec<u8>,
     active_hyperlink: &mut Option<String>,
     frame: &FrameData,
 ) {
@@ -664,10 +667,19 @@ fn write_cell(
 
     let _ = write!(writer, "\x1b[{};{}H", row + 1, col + 1);
 
-    let sgr = build_sgr(cell.fg, cell.bg, cell.modifier);
-    if sgr != *last_sgr {
-        let _ = writer.write_all(sgr.as_bytes());
-        *last_sgr = sgr;
+    // Only re-emit SGR when the style actually changed from the last written
+    // cell. The (fg, bg, modifier) tuple fully determines the SGR bytes, so we
+    // dedup on style identity rather than on the rendered byte string. For the
+    // canonical colors `color_to_u32` produces (the only frame source) this is
+    // byte-identical to comparing the emitted SGR; non-canonical deserialized
+    // u32s that collapse to the same fallback (`39`/`49`) may re-emit a
+    // redundant but identical SGR, which is harmless.
+    let style = (cell.fg, cell.bg, cell.modifier);
+    if *last_style != Some(style) {
+        sgr_buf.clear();
+        build_sgr_into(sgr_buf, cell.fg, cell.bg, cell.modifier);
+        let _ = writer.write_all(sgr_buf);
+        *last_style = Some(style);
     }
 
     write_hyperlink_if_changed(writer, active_hyperlink, cell_hyperlink_uri(frame, cell));
@@ -691,7 +703,10 @@ fn cells_visually_equal(
 }
 
 fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameData) {
-    let mut last_sgr = String::new(); // Track last SGR to avoid redundant style changes.
+    // Track the last written style to avoid redundant SGR changes, plus a scratch
+    // buffer reused across cells (one allocation per frame, not per cell).
+    let mut last_style: Option<(u32, u32, u16)> = None;
+    let mut sgr_buf = Vec::new();
     let mut active_hyperlink = None;
     let sanitized_hyperlinks = sanitized_frame_hyperlinks(frame);
     let prev_sanitized_hyperlinks = sanitized_frame_hyperlinks(prev);
@@ -719,7 +734,8 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
                     row,
                     col,
                     cell,
-                    &mut last_sgr,
+                    &mut last_style,
+                    &mut sgr_buf,
                     &mut active_hyperlink,
                     frame,
                 );
@@ -734,7 +750,7 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
     close_hyperlink(writer, &mut active_hyperlink);
 
     // Reset style if we wrote anything.
-    if !last_sgr.is_empty() {
+    if last_style.is_some() {
         let _ = writer.write_all(b"\x1b[0m");
     }
 }
@@ -752,7 +768,7 @@ mod tests {
 
     fn make_cell(symbol: &str, fg: u32, bg: u32, modifier: u16) -> CellData {
         CellData {
-            symbol: symbol.to_owned(),
+            symbol: symbol.into(),
             fg,
             bg,
             modifier,
@@ -776,6 +792,27 @@ mod tests {
         let mut cell = make_cell(symbol, 0, 0, 0);
         cell.hyperlink = Some(index);
         cell
+    }
+
+    // Test-only String views over the production byte writers, so the existing
+    // byte-contract unit tests read naturally and pin the same output the hot
+    // path emits.
+    fn build_sgr(fg: u32, bg: u32, modifier: u16) -> String {
+        let mut out = Vec::new();
+        build_sgr_into(&mut out, fg, bg, modifier);
+        String::from_utf8(out).unwrap()
+    }
+
+    fn color_to_sgr_fg(val: u32) -> String {
+        let mut out = Vec::new();
+        write_color_sgr_fg(&mut out, val);
+        String::from_utf8(out).unwrap()
+    }
+
+    fn color_to_sgr_bg(val: u32) -> String {
+        let mut out = Vec::new();
+        write_color_sgr_bg(&mut out, val);
+        String::from_utf8(out).unwrap()
     }
 
     #[test]
@@ -808,23 +845,8 @@ mod tests {
         assert_eq!(color_to_sgr_bg(0x02_FF_80_40), "48;2;255;128;64");
     }
 
-    #[test]
-    fn modifier_to_sgr_parts_bold() {
-        let parts = modifier_to_sgr_parts(1); // BOLD
-        assert!(parts.contains(&"1"));
-    }
-
-    #[test]
-    fn modifier_to_sgr_parts_italic() {
-        let parts = modifier_to_sgr_parts(4); // ITALIC
-        assert!(parts.contains(&"3"));
-    }
-
-    #[test]
-    fn modifier_to_sgr_parts_empty() {
-        let parts = modifier_to_sgr_parts(0);
-        assert!(parts.is_empty());
-    }
+    // Modifier bit->param mapping and ordering are pinned exactly by
+    // build_sgr_all_modifiers_mapped and build_sgr_exact_styled_ordering below.
 
     #[test]
     fn build_sgr_produces_valid_sequence() {
@@ -840,6 +862,26 @@ mod tests {
     #[test]
     fn build_sgr_resets_previous_modifiers_when_cell_is_plain() {
         assert_eq!(build_sgr(0x00_00_00_00, 0x00_00_00_00, 0), "\x1b[0;39;49m");
+    }
+
+    // Characterization: exact SGR parameter ORDER is reset(0) -> modifiers -> fg -> bg.
+    // Pins the byte contract before the SGR direct-write rewrite (CHANGE C).
+    #[test]
+    fn build_sgr_exact_styled_ordering() {
+        // fg = RGB(255,128,64), bg = indexed 171, modifiers = BOLD|REVERSED.
+        assert_eq!(
+            build_sgr(0x02_FF_80_40, 0x01_00_00_AB, 0x41),
+            "\x1b[0;1;7;38;2;255;128;64;48;5;171m"
+        );
+    }
+
+    // Characterization: every modifier bit maps to its SGR param, in bitmask order.
+    #[test]
+    fn build_sgr_all_modifiers_mapped() {
+        assert_eq!(
+            build_sgr(0x00_00_00_00, 0x00_00_00_00, 0x1FF),
+            "\x1b[0;1;2;3;4;5;6;7;8;9;39;49m"
+        );
     }
 
     #[test]
@@ -1627,5 +1669,108 @@ mod tests {
 
         assert!(output_str.contains("\x1b[1;1H"));
         assert!(!output_str.contains("\x1b[1;2H"));
+    }
+
+    // ZWJ family emoji: >24 bytes (heap-backed even for CompactString), width 2.
+    const ZWJ_FAMILY: &str = "👨‍👩‍👧‍👦";
+
+    // Characterization (CHANGE C byte-pin): full-redraw produces an exact byte
+    // stream — sync/hide prefix, per-cell CUP+SGR+symbol, trailing reset, cursor
+    // suffix. Mixes named-fg, RGB-fg+indexed-bg+bold, and a plain cell so the
+    // SGR direct-write rewrite is pinned across all color encodings.
+    #[test]
+    fn blit_full_redraw_exact_byte_stream() {
+        let frame = make_frame(
+            3,
+            1,
+            vec![
+                make_cell("A", 0x00_00_00_02, 0x00_00_00_00, 0), // named fg red
+                make_cell("B", 0x02_FF_80_40, 0x01_00_00_AB, 0x01), // rgb fg, indexed bg, bold
+                make_cell("C", 0x00_00_00_00, 0x00_00_00_00, 0), // plain
+            ],
+        );
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &frame, None);
+
+        assert_eq!(
+            output,
+            b"\x1b[?25l\x1b[?2026h\x1b]8;;\x1b\\\x1b[2J\x1b[H\
+\x1b[1;1H\x1b[0;31;49mA\
+\x1b[1;2H\x1b[0;1;38;2;255;128;64;48;5;171mB\
+\x1b[1;3H\x1b[0;39;49mC\
+\x1b[0m\x1b[1;3H\x1b[?25l\x1b[?2026l\x1b[1;3H\x1b[?25l"
+                .to_vec(),
+            "full-redraw byte stream changed; actual = {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    // Characterization: adjacent changed cells with identical style emit the SGR
+    // sequence exactly once (last_sgr dedup). Pins CHANGE C's dedup contract.
+    #[test]
+    fn blit_diff_dedups_adjacent_same_style_sgr() {
+        let prev = make_frame(2, 1, vec![make_cell("a", 5, 6, 0), make_cell("b", 5, 6, 0)]);
+        let curr = make_frame(2, 1, vec![make_cell("X", 5, 6, 0), make_cell("Y", 5, 6, 0)]);
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &curr, Some(&prev));
+        let s = String::from_utf8(output).unwrap();
+
+        let sgr = build_sgr(5, 6, 0);
+        assert_eq!(
+            s.matches(&sgr).count(),
+            1,
+            "identical adjacent styles must emit SGR once, got: {s:?}"
+        );
+        assert!(s.contains('X') && s.contains('Y'));
+    }
+
+    // Characterization: an empty-symbol cell still emits its CUP move but no
+    // symbol bytes, and does not consume following columns (width 0).
+    #[test]
+    fn blit_empty_symbol_cell_writes_cup_no_symbol_bytes() {
+        let frame = make_frame(2, 1, vec![make_cell("", 0, 0, 0), make_cell("Z", 0, 0, 0)]);
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &frame, None);
+        let s = String::from_utf8(output).unwrap();
+
+        // Both columns addressed; empty cell contributes no glyph, "Z" present.
+        assert!(s.contains("\x1b[1;1H"));
+        assert!(s.contains("\x1b[1;2H"));
+        assert!(s.contains('Z'));
+    }
+
+    // Characterization: a multi-codepoint ZWJ grapheme is written verbatim and
+    // its trailing (width-2) column is skipped. Guards the inline/heap boundary
+    // of the symbol type under the String->CompactString swap.
+    #[test]
+    fn blit_wide_zwj_grapheme_intact_and_skips_column() {
+        assert!(ZWJ_FAMILY.len() > 24, "fixture must exceed inline capacity");
+        let frame = make_frame(
+            3,
+            1,
+            vec![
+                make_cell(ZWJ_FAMILY, 0, 0, 0),
+                make_cell(" ", 0, 0, 0),
+                make_cell("Z", 0, 0, 0),
+            ],
+        );
+
+        let mut output = Vec::new();
+        blit_frame_to(&mut output, &frame, None);
+        let s = String::from_utf8(output).unwrap();
+
+        assert!(
+            s.contains(ZWJ_FAMILY),
+            "wide grapheme must be written verbatim"
+        );
+        assert!(s.contains("\x1b[1;1H"));
+        assert!(
+            !s.contains("\x1b[1;2H"),
+            "trailing column of wide cell skipped"
+        );
+        assert!(s.contains("\x1b[1;3H"));
     }
 }

@@ -71,13 +71,18 @@ impl ClientRenderState {
                     "prepare_frame.graphics.bytes",
                     frame.graphics.len() as u64,
                 );
+                // Move the encoded bytes into the outgoing message rather than
+                // cloning the whole frame buffer; `commit` only consumes the
+                // cursor/shape/frame state from `encoded`, not its bytes.
+                let full = encoded.full;
+                let bytes = std::mem::take(&mut encoded.bytes);
                 Some(PreparedRender::TerminalAnsi {
                     message: ServerMessage::Terminal(TerminalFrame {
                         seq: *seq + 1,
                         width: frame.width,
                         height: frame.height,
-                        full: encoded.full,
-                        bytes: encoded.bytes.clone(),
+                        full,
+                        bytes,
                     }),
                     frame,
                     encoded: Some(encoded),

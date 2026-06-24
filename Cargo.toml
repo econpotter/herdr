@@ -15,6 +15,10 @@ include = ["src/**/*", "assets/sounds/*", "README.md", "LICENSE", "Cargo.toml"]
 base64 = "0.22.1"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
+# Already in the tree transitively via ratatui-core; promoted to a direct dep
+# with the serde feature so CellData.symbol can store grapheme clusters inline
+# (no per-cell heap alloc on the render hot path). Pinned to the resolved 0.9.x.
+compact_str = { version = "0.9", features = ["serde"] }
 crossterm = "0.29"
 ctrlc = "3"
 interprocess = "2.4.2"

@@ -171,6 +171,7 @@ dependencies = [
  "itoa",
  "rustversion",
  "ryu",
+ "serde",
  "static_assertions",
 ]
 
@@ -542,6 +543,7 @@ dependencies = [
  "base64",
  "bincode",
  "bytes",
+ "compact_str",
  "crossterm",
  "ctrlc",
  "interprocess",
