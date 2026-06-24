@@ -272,6 +272,19 @@ impl AppState {
         self.mark_session_dirty();
     }
 
+    /// Adjust the sidebar width by `delta` columns from the keyboard, clamped to
+    /// the configured bounds. Mirrors the mouse drag path's persistence
+    /// semantics: marks the width as manually set so it round-trips through the
+    /// session snapshot.
+    pub(super) fn nudge_sidebar_width(&mut self, delta: i16) {
+        let width = (self.sidebar_width as i32 + delta as i32)
+            .clamp(self.sidebar_min_width as i32, self.sidebar_max_width as i32)
+            as u16;
+        self.sidebar_width = width;
+        self.sidebar_width_source = crate::app::state::SidebarWidthSource::Manual;
+        self.mark_session_dirty();
+    }
+
     pub(super) fn on_sidebar_section_divider(&self, col: u16, row: u16) -> bool {
         if self.sidebar_collapsed {
             return false;
@@ -1513,6 +1526,42 @@ mod tests {
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 5));
         app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5, 5));
+
+        assert_eq!(app.state.sidebar_width, 22);
+    }
+
+    #[test]
+    fn nudging_sidebar_width_widens_and_narrows() {
+        let mut app = app_for_mouse_test();
+        assert_eq!(app.state.sidebar_width, 26);
+
+        app.state.nudge_sidebar_width(2);
+        assert_eq!(app.state.sidebar_width, 28);
+        assert_eq!(
+            app.state.sidebar_width_source,
+            crate::app::state::SidebarWidthSource::Manual
+        );
+
+        app.state.nudge_sidebar_width(-2);
+        assert_eq!(app.state.sidebar_width, 26);
+    }
+
+    #[test]
+    fn nudging_sidebar_width_clamps_to_max() {
+        let mut app = app_for_mouse_test();
+        app.state.sidebar_max_width = 30;
+
+        app.state.nudge_sidebar_width(20);
+
+        assert_eq!(app.state.sidebar_width, 30);
+    }
+
+    #[test]
+    fn nudging_sidebar_width_clamps_to_min() {
+        let mut app = app_for_mouse_test();
+        app.state.sidebar_min_width = 22;
+
+        app.state.nudge_sidebar_width(-20);
 
         assert_eq!(app.state.sidebar_width, 22);
     }

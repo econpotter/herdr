@@ -630,6 +630,18 @@ pub(crate) fn handle_resize_key(state: &mut AppState, raw_key: TerminalKey) {
         return;
     }
 
+    // With a terminal pane focused, h/l/j/k resize the focused split. With no
+    // active pane (sidebar/Navigate focus), h/l resize the sidebar instead.
+    if state.active.is_none() {
+        const SIDEBAR_RESIZE_STEP: i16 = 2;
+        match key.code {
+            KeyCode::Char('h') | KeyCode::Left => state.nudge_sidebar_width(-SIDEBAR_RESIZE_STEP),
+            KeyCode::Char('l') | KeyCode::Right => state.nudge_sidebar_width(SIDEBAR_RESIZE_STEP),
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('h') | KeyCode::Left => state.resize_pane(NavDirection::Left),
         KeyCode::Char('l') | KeyCode::Right => state.resize_pane(NavDirection::Right),
@@ -965,6 +977,42 @@ mod tests {
         );
 
         assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn resize_key_resizes_sidebar_when_no_pane_active() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.active = None;
+        state.mode = Mode::Resize;
+        let start = state.sidebar_width;
+
+        handle_resize_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Char('l'), KeyModifiers::empty()),
+        );
+        assert_eq!(state.sidebar_width, start + 2);
+        assert_eq!(state.mode, Mode::Resize);
+
+        handle_resize_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Char('h'), KeyModifiers::empty()),
+        );
+        assert_eq!(state.sidebar_width, start);
+    }
+
+    #[test]
+    fn resize_key_leaves_sidebar_width_when_pane_active() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.active = Some(0);
+        state.mode = Mode::Resize;
+        let start = state.sidebar_width;
+
+        handle_resize_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Char('l'), KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.sidebar_width, start);
     }
 
     #[test]
