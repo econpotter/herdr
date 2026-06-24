@@ -125,6 +125,16 @@ impl ClientConnection {
         self.graphics_surface_reset_pending = true;
     }
 
+    /// Repaints all cells (keyframe) but keeps the kitty-graphics surface as-is,
+    /// so no images are retransmitted. Used on focus-regain: the host terminal
+    /// may have dropped text while unfocused, but graphics persist across focus
+    /// in practice — retransmitting every image is the source of the visible
+    /// refocus stutter. Falls back to `request_full_redraw` when graphics really
+    /// must be re-sent (resize, reconnect).
+    pub(crate) fn request_cell_redraw(&mut self) {
+        self.render_state.reset_baseline();
+    }
+
     pub(crate) fn is_full_app_client(&self) -> bool {
         matches!(self.mode, ClientConnectionMode::App) && !self.pending_terminal_attach
     }

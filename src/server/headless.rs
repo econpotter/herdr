@@ -2272,7 +2272,10 @@ impl HeadlessServer {
         );
         if let Some(client) = self.clients.get_mut(&client_id) {
             if host_surface_redraw {
-                client.request_full_redraw();
+                // Repaint cells without retransmitting graphics: the image
+                // resend is what makes refocus stutter, and host terminals keep
+                // graphics across focus.
+                client.request_cell_redraw();
                 client.render_pending = true;
             } else {
                 // Ensure semantic clients receive one post-input frame even if the
@@ -6600,6 +6603,46 @@ next_tab = ""
             }
             other => panic!("expected terminal frame, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn outer_focus_gained_repaints_cells_without_graphics_retransmit() {
+        let (mut server, client_rx, _pane_id) = retained_test_server(b"hello");
+        server.app.state.redraw_on_focus_gained = true;
+
+        // Establish a cell baseline and a clean graphics surface.
+        server.render_and_stream();
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial semantic frame");
+        {
+            let client = server.clients.get(&1).expect("client");
+            assert!(
+                client.render_state.last_frame().is_some(),
+                "baseline frame should be cached after the first render"
+            );
+            assert!(
+                !client.graphics_surface_reset_pending,
+                "graphics surface should be settled after the first render"
+            );
+        }
+
+        // A focus-gained report must repaint cells but not retransmit graphics.
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"\x1b[I".to_vec(),
+        }));
+
+        let client = server.clients.get(&1).expect("client");
+        assert!(
+            client.render_state.last_frame().is_none(),
+            "focus-gained must reset the cell baseline for a full keyframe"
+        );
+        assert!(client.render_pending, "focus-gained must request a frame");
+        assert!(
+            !client.graphics_surface_reset_pending,
+            "focus-gained must not reset the graphics surface (no image retransmit)"
+        );
     }
 
     #[tokio::test]
