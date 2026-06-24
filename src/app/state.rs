@@ -1511,6 +1511,27 @@ impl AppState {
         self.mouse_capture || self.focused_pane_requests_mouse_capture_from(terminal_runtimes)
     }
 
+    /// The host mouse reporting mode the foreground client should enable. Plain
+    /// Terminal mode (Herdr's own click/drag UI, no pane mouse) needs only
+    /// button-motion; free-hover any-motion would flood the server with no-op
+    /// events. Hover menus and panes that report mouse use any-motion.
+    pub(crate) fn host_mouse_capture_mode_from(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ) -> crate::protocol::HostMouseCaptureMode {
+        use crate::protocol::HostMouseCaptureMode;
+        if !self.should_capture_host_mouse_from(terminal_runtimes) {
+            return HostMouseCaptureMode::Off;
+        }
+        if self.mode == Mode::Terminal
+            && !self.focused_pane_requests_mouse_capture_from(terminal_runtimes)
+        {
+            HostMouseCaptureMode::ButtonMotion
+        } else {
+            HostMouseCaptureMode::AnyMotion
+        }
+    }
+
     pub fn is_prefix_key(&self, key: crate::input::TerminalKey) -> bool {
         crate::config::terminal_key_matches_combo(key, (self.prefix_code, self.prefix_mods))
     }
@@ -2112,6 +2133,45 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn host_mouse_capture_mode_is_button_motion_in_plain_terminal() {
+        let mut state = AppState::test_new();
+        state.mouse_capture = true;
+        state.mode = Mode::Terminal;
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        // No focused pane requesting mouse: Herdr's own click/drag UI only needs
+        // button-motion, not free-hover any-motion.
+        assert_eq!(
+            state.host_mouse_capture_mode_from(&runtimes),
+            crate::protocol::HostMouseCaptureMode::ButtonMotion
+        );
+    }
+
+    #[test]
+    fn host_mouse_capture_mode_is_any_motion_outside_terminal() {
+        let mut state = AppState::test_new();
+        state.mouse_capture = true;
+        state.mode = Mode::Navigate;
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        // Overlay/menu modes may use hover, so they keep any-motion.
+        assert_eq!(
+            state.host_mouse_capture_mode_from(&runtimes),
+            crate::protocol::HostMouseCaptureMode::AnyMotion
+        );
+    }
+
+    #[test]
+    fn host_mouse_capture_mode_is_off_when_capture_disabled() {
+        let mut state = AppState::test_new();
+        state.mouse_capture = false;
+        state.mode = Mode::Terminal;
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        assert_eq!(
+            state.host_mouse_capture_mode_from(&runtimes),
+            crate::protocol::HostMouseCaptureMode::Off
+        );
+    }
 
     #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {

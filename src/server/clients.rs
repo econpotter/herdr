@@ -52,7 +52,7 @@ pub(crate) struct ClientConnection {
     /// Whether a render was skipped because the render channel was full.
     pub(crate) render_pending: bool,
     /// Last host mouse capture mode sent to this client.
-    pub(crate) host_mouse_capture_active: Option<bool>,
+    pub(crate) host_mouse_capture_active: Option<crate::protocol::HostMouseCaptureMode>,
     /// Temporary files staged from this client's local clipboard image pastes.
     pub(crate) staged_clipboard_files: Vec<PathBuf>,
     /// Channels for sending framed ServerMessage data to the client writer thread.

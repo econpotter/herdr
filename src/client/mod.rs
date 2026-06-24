@@ -22,8 +22,12 @@ use std::time::Duration;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture,
+    EnableFocusChange,
 };
+// Host mouse reporting is driven by explicit DECSET sequences on Unix; the
+// crossterm console-mode helper is only needed on Windows.
+#[cfg(windows)]
+use crossterm::event::EnableMouseCapture;
 #[cfg(unix)]
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 #[cfg(not(windows))]
@@ -54,7 +58,7 @@ struct ClientLoopConfig {
     mouse_scroll_lines: usize,
     redraw_on_focus_gained: bool,
     kitty_graphics_enabled: bool,
-    mouse_capture_active: bool,
+    mouse_capture_active: crate::protocol::HostMouseCaptureMode,
     #[cfg(unix)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
 }
@@ -69,8 +73,8 @@ struct ClientState {
     /// frame baseline — discarding it would make an incoming `FrameDiff`
     /// unappliable.
     force_full_host_redraw: bool,
-    /// Whether host mouse capture is currently active.
-    mouse_capture_active: bool,
+    /// Current host mouse capture mode (off / button-motion / any-motion).
+    mouse_capture_active: crate::protocol::HostMouseCaptureMode,
     /// The terminal size we reported to the server in our last Hello/Resize.
     reported_size: (u16, u16),
     /// Client-local sound playback config, refreshed on server request.
@@ -343,9 +347,9 @@ fn setup_terminal_with_capabilities(
 
     if enable_client_protocols {
         if mouse_capture {
-            set_mouse_capture(true)?;
+            set_mouse_capture(crate::protocol::HostMouseCaptureMode::AnyMotion)?;
         } else {
-            set_mouse_capture(false)?;
+            set_mouse_capture(crate::protocol::HostMouseCaptureMode::Off)?;
         }
         execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
         if host_color_scheme_reports {
@@ -357,9 +361,9 @@ fn setup_terminal_with_capabilities(
             write_host_color_scheme_report_mode(&mut io::stdout(), false)?;
         }
         if mouse_capture {
-            set_mouse_capture(true)?;
+            set_mouse_capture(crate::protocol::HostMouseCaptureMode::AnyMotion)?;
         } else {
-            set_mouse_capture(false)?;
+            set_mouse_capture(crate::protocol::HostMouseCaptureMode::Off)?;
         }
     }
 
@@ -530,16 +534,36 @@ fn restore_windows_input_mode_value(mode: u32) {
     }
 }
 
-fn set_mouse_capture(enabled: bool) -> io::Result<()> {
-    if enabled {
-        execute!(io::stdout(), EnableMouseCapture)
-    } else {
-        match execute!(io::stdout(), DisableMouseCapture) {
-            Ok(()) => Ok(()),
-            #[cfg(windows)]
-            Err(err) if err.to_string() == "Initial console modes not set" => Ok(()),
-            Err(err) => Err(err),
+#[cfg(unix)]
+fn set_mouse_capture(mode: crate::protocol::HostMouseCaptureMode) -> io::Result<()> {
+    use crate::protocol::HostMouseCaptureMode;
+    // Absolute DECSET state written each time (idempotent). ButtonMotion enables
+    // clicks (1000) + button-held drag motion (1002) + SGR coords (1006) but
+    // explicitly disables free-hover any-motion (1003) — that is the flood we
+    // avoid when nothing in plain Terminal mode uses hover.
+    let seq: &[u8] = match mode {
+        HostMouseCaptureMode::Off => b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l",
+        HostMouseCaptureMode::ButtonMotion => b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h",
+        HostMouseCaptureMode::AnyMotion => b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
+    };
+    let mut out = io::stdout();
+    out.write_all(seq)?;
+    out.flush()
+}
+
+#[cfg(windows)]
+fn set_mouse_capture(mode: crate::protocol::HostMouseCaptureMode) -> io::Result<()> {
+    // The Windows console mouse backend has no hover-flood problem and no
+    // motion-granularity knob, so any reporting mode maps to EnableMouseCapture.
+    match mode {
+        crate::protocol::HostMouseCaptureMode::Off => {
+            match execute!(io::stdout(), DisableMouseCapture) {
+                Ok(()) => Ok(()),
+                Err(err) if err.to_string() == "Initial console modes not set" => Ok(()),
+                Err(err) => Err(err),
+            }
         }
+        _ => execute!(io::stdout(), EnableMouseCapture),
     }
 }
 
@@ -851,7 +875,11 @@ fn run_client_with_mode(
         mouse_scroll_lines,
         redraw_on_focus_gained,
         kitty_graphics_enabled,
-        mouse_capture_active: mouse_capture,
+        mouse_capture_active: if mouse_capture {
+            crate::protocol::HostMouseCaptureMode::AnyMotion
+        } else {
+            crate::protocol::HostMouseCaptureMode::Off
+        },
         #[cfg(unix)]
         remote_image_paste_key,
     };
@@ -1277,8 +1305,8 @@ async fn run_client_loop(
                         &mut state.remote_image_paste_key,
                     );
                 }
-                ServerMessage::MouseCapture { enabled } => {
-                    let desired = enabled;
+                ServerMessage::MouseCapture { mode } => {
+                    let desired = mode;
                     if desired != state.mouse_capture_active {
                         set_mouse_capture(desired).map_err(ClientError::ConnectionFailed)?;
                         #[cfg(windows)]

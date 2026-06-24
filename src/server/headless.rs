@@ -2959,12 +2959,11 @@ impl HeadlessServer {
     }
 
     fn stream_host_mouse_capture_mode(&mut self) {
-        let enabled = self
+        let mode = self
             .app
             .state
-            .should_capture_host_mouse_from(&self.app.terminal_runtimes);
-        let serialized = match Self::frame_server_message(&ServerMessage::MouseCapture { enabled })
-        {
+            .host_mouse_capture_mode_from(&self.app.terminal_runtimes);
+        let serialized = match Self::frame_server_message(&ServerMessage::MouseCapture { mode }) {
             Ok(framed) => framed,
             Err(err) => {
                 warn!(err = %err, "failed to serialize mouse capture mode for clients");
@@ -2977,7 +2976,7 @@ impl HeadlessServer {
             if !client.is_full_app_client() {
                 continue;
             }
-            if client.host_mouse_capture_active == Some(enabled) {
+            if client.host_mouse_capture_active == Some(mode) {
                 continue;
             }
             let Some(writer) = &client.writer else {
@@ -2991,7 +2990,7 @@ impl HeadlessServer {
                 broken_clients.push(client_id);
                 continue;
             }
-            client.host_mouse_capture_active = Some(enabled);
+            client.host_mouse_capture_active = Some(mode);
         }
 
         for client_id in broken_clients {

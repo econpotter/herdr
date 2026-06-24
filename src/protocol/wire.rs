@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
 ///
-/// 15: added `ServerMessage::FrameDiff` for incremental semantic frame updates.
+/// 15: added `ServerMessage::FrameDiff` for incremental semantic frame updates;
+///     `ServerMessage::MouseCapture` now carries a `HostMouseCaptureMode` instead
+///     of a bool so the client can request button-motion vs any-motion reporting.
 pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
@@ -44,6 +46,22 @@ pub enum RenderEncoding {
     SemanticFrame,
     /// Send already-diffed terminal ANSI byte streams.
     TerminalAnsi,
+}
+
+/// How much host mouse reporting the client should enable. Free hover motion
+/// (`AnyMotion`, DECSET 1003) floods the server with no-op events when nothing
+/// uses it, so plain Terminal mode (Herdr's own click/drag UI, no pane mouse,
+/// no hover menu) asks only for `ButtonMotion` (DECSET 1002: motion while a
+/// button is held). `AnyMotion` is reserved for hover menus and panes that
+/// request motion reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostMouseCaptureMode {
+    /// No mouse reporting.
+    Off,
+    /// Clicks plus button-held drag motion (DECSET 1000 + 1002), no free hover.
+    ButtonMotion,
+    /// All motion including free hover (DECSET 1000 + 1002 + 1003).
+    AnyMotion,
 }
 
 /// Keybinding profile requested by an attached app client.
@@ -728,10 +746,10 @@ pub enum ServerMessage {
     /// Client-local runtime config changed on disk; refresh it without reconnecting.
     ReloadSoundConfig,
 
-    /// Whether the client should currently capture host mouse input.
+    /// How much host mouse reporting the client should currently enable.
     MouseCapture {
-        /// True when Herdr mouse UI is enabled or the focused pane app requests mouse reporting.
-        enabled: bool,
+        /// Off, button-motion (clicks + drag), or any-motion (incl. free hover).
+        mode: HostMouseCaptureMode,
     },
 
     /// An incremental update to a semantic-frame client's previous [`FrameData`].
@@ -1472,7 +1490,9 @@ mod tests {
 
     #[test]
     fn server_mouse_capture_roundtrip() {
-        let msg = ServerMessage::MouseCapture { enabled: true };
+        let msg = ServerMessage::MouseCapture {
+            mode: HostMouseCaptureMode::ButtonMotion,
+        };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
