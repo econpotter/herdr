@@ -2230,11 +2230,42 @@ impl HeadlessServer {
     }
 
     /// Handles a server event. Returns true if the event requires a re-render.
+    /// Profiler attribution: which raw input kinds arrive. `ClientInput`
+    /// dominates full renders; this breaks it down so we can tell mouse motion
+    /// (free-hover flood, usually no view change) from keys/clicks/scroll.
+    fn profile_input_event_kinds(events: &[crate::raw_input::RawInputEvent]) {
+        use crate::raw_input::RawInputEvent;
+        use crossterm::event::MouseEventKind;
+        for ev in events {
+            let kind = match ev {
+                RawInputEvent::Key(_) => "input_kind.key",
+                RawInputEvent::Paste(_) => "input_kind.paste",
+                RawInputEvent::Mouse(m) => match m.kind {
+                    MouseEventKind::Moved => "input_kind.mouse_moved",
+                    MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
+                        "input_kind.mouse_button"
+                    }
+                    MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight => "input_kind.mouse_scroll",
+                },
+                RawInputEvent::OuterFocusGained => "input_kind.focus_gained",
+                RawInputEvent::OuterFocusLost => "input_kind.focus_lost",
+                RawInputEvent::HostDefaultColor { .. } => "input_kind.host_color",
+                RawInputEvent::HostColorSchemeChanged(_) => "input_kind.color_scheme",
+                RawInputEvent::Unsupported => "input_kind.unsupported",
+            };
+            crate::render_prof::event(kind);
+        }
+    }
+
     fn handle_client_input_events(
         &mut self,
         client_id: u64,
         events: Vec<crate::raw_input::RawInputEvent>,
     ) -> bool {
+        Self::profile_input_event_kinds(&events);
         let host_surface_redraw = crate::raw_input::events_require_host_surface_redraw(
             &events,
             self.app.state.redraw_on_focus_gained,
