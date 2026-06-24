@@ -548,6 +548,66 @@ fn decode_frame_payload(payload: &[u8]) -> io::Result<FrameWire> {
         })
 }
 
+/// Wire mirror of `protocol::FrameDiffData` (ServerMessage::FrameDiff, variant 10).
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct FrameDiffWire {
+    width: u16,
+    height: u16,
+    cursor: Option<CursorWire>,
+    rows: Vec<(u16, Vec<CellWire>)>,
+    hyperlinks: Vec<String>,
+    graphics: Vec<u8>,
+}
+
+/// Variant index of `ServerMessage::FrameDiff` in the enum declaration order.
+const FRAME_DIFF_VARIANT: u32 = 10;
+
+fn decode_frame_diff_payload(payload: &[u8]) -> io::Result<FrameDiffWire> {
+    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+        .map(|(diff, _consumed): (FrameDiffWire, usize)| diff)
+}
+
+/// A blank frame of the given size, used to seed a baseline when a diff arrives
+/// before any keyframe (e.g. after a test drains the initial frame). Changed
+/// rows from the diff still land correctly; untouched rows stay blank, which is
+/// sufficient for "frame contains text" assertions on newly appeared content.
+fn blank_frame(width: u16, height: u16) -> FrameWire {
+    let count = usize::from(width) * usize::from(height);
+    FrameWire {
+        cells: (0..count)
+            .map(|_| CellWire {
+                symbol: " ".to_string(),
+                fg: 0,
+                bg: 0,
+                modifier: 0,
+                skip: false,
+                hyperlink: None,
+            })
+            .collect(),
+        width,
+        height,
+        cursor: None,
+        hyperlinks: Vec::new(),
+        graphics: Vec::new(),
+    }
+}
+
+/// Reconstructs a full frame by applying a diff to the cached baseline.
+fn apply_frame_diff(base: &mut FrameWire, diff: FrameDiffWire) {
+    let width = base.width as usize;
+    for (y, row) in diff.rows {
+        let start = (y as usize) * width;
+        for (i, cell) in row.into_iter().enumerate() {
+            base.cells[start + i] = cell;
+        }
+    }
+    base.cursor = diff.cursor;
+    base.hyperlinks = diff.hyperlinks;
+    base.graphics = diff.graphics;
+}
+
 fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
     if frame.cells.is_empty() {
         return false;
@@ -621,20 +681,28 @@ fn wait_for_frame_matching(
     predicate: impl Fn(&FrameWire) -> bool,
 ) -> io::Result<bool> {
     let deadline = Instant::now() + timeout;
+    let mut baseline: Option<FrameWire> = None;
     while Instant::now() < deadline {
         let slice = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(80));
         match read_server_message_payload(stream, slice) {
             Ok((1, payload)) => {
-                let frame = decode_frame_payload(&payload)?;
-                if predicate(&frame) {
-                    return Ok(true);
-                }
+                baseline = Some(decode_frame_payload(&payload)?);
             }
-            Ok((_variant, _payload)) => {}
-            Err(err) if is_timeout(&err) => {}
+            Ok((FRAME_DIFF_VARIANT, payload)) => {
+                let diff = decode_frame_diff_payload(&payload)?;
+                let base = baseline.get_or_insert_with(|| blank_frame(diff.width, diff.height));
+                apply_frame_diff(base, diff);
+            }
+            Ok((_variant, _payload)) => continue,
+            Err(err) if is_timeout(&err) => continue,
             Err(err) => return Err(err),
+        }
+        if let Some(frame) = baseline.as_ref() {
+            if predicate(frame) {
+                return Ok(true);
+            }
         }
     }
 
@@ -687,7 +755,7 @@ fn cross_area_detach_and_reattach_preserves_state() {
 
     // Local attach (client A).
     let mut client_a = UnixStream::connect(&client_socket).expect("client A should connect");
-    client_handshake(&mut client_a, 14, 100, 30);
+    client_handshake(&mut client_a, 15, 100, 30);
     assert!(wait_for_frame(&mut client_a, Duration::from_secs(2)));
 
     // Use herdr: create a workspace and write output into its pane.
@@ -724,7 +792,7 @@ fn cross_area_detach_and_reattach_preserves_state() {
 
     // Reattach from another terminal/session (client B).
     let mut client_b = UnixStream::connect(&client_socket).expect("client B should connect");
-    client_handshake(&mut client_b, 14, 80, 24);
+    client_handshake(&mut client_b, 15, 80, 24);
     assert!(
         wait_for_frame(&mut client_b, Duration::from_secs(5)),
         "reattached client should receive frame"
@@ -780,7 +848,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
     let mut client_a = UnixStream::connect(&client_socket).expect("client A should connect");
-    client_handshake(&mut client_a, 14, 100, 30);
+    client_handshake(&mut client_a, 15, 100, 30);
     assert!(wait_for_frame(&mut client_a, Duration::from_secs(2)));
 
     let created = workspace_create(&api_socket, "agent-persist");
@@ -833,7 +901,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
 
     // Reattach and ensure client-side state reflects the persisted working status.
     let mut client_b = UnixStream::connect(&client_socket).expect("client B should connect");
-    client_handshake(&mut client_b, 14, 80, 24);
+    client_handshake(&mut client_b, 15, 80, 24);
     let saw_working_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
             frame_contains_text(frame, "working")
@@ -878,7 +946,7 @@ fn cross_area_client_and_api_workspace_views_are_consistent() {
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
     let mut client = UnixStream::connect(&client_socket).expect("client should connect");
-    client_handshake(&mut client, 14, 100, 30);
+    client_handshake(&mut client, 15, 100, 30);
     assert!(wait_for_frame(&mut client, Duration::from_secs(2)));
     drain_server_messages(&mut client, Duration::from_millis(300));
 
@@ -941,9 +1009,9 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
     let mut client_a = UnixStream::connect(&client_socket).expect("client A should connect");
-    client_handshake(&mut client_a, 14, 110, 30);
+    client_handshake(&mut client_a, 15, 110, 30);
     let mut client_b = UnixStream::connect(&client_socket).expect("client B should connect");
-    client_handshake(&mut client_b, 14, 100, 30);
+    client_handshake(&mut client_b, 15, 100, 30);
 
     assert!(wait_for_frame(&mut client_a, Duration::from_secs(2)));
     assert!(wait_for_frame(&mut client_b, Duration::from_secs(2)));
@@ -1112,7 +1180,7 @@ fn cross_area_server_kill_then_restart_and_reconnect() {
 
     let mut reconnect_client =
         UnixStream::connect(&client_socket).expect("new client should connect after restart");
-    client_handshake(&mut reconnect_client, 14, 80, 24);
+    client_handshake(&mut reconnect_client, 15, 80, 24);
     assert!(
         wait_for_frame(&mut reconnect_client, Duration::from_secs(5)),
         "new client should receive frame after restart"

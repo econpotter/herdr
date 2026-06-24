@@ -243,6 +243,9 @@ pub struct HeadlessServer {
     server_event_rx: mpsc::Receiver<ServerEvent>,
     /// Sender for server events (cloned for each client thread).
     server_event_tx: mpsc::Sender<ServerEvent>,
+    /// Pooled virtual renderer reused across full App-client frames to avoid
+    /// per-frame screen-sized buffer allocation.
+    virtual_renderer: crate::server::render_stream::VirtualRenderer,
 }
 
 fn apply_terminal_attach_scroll(
@@ -428,6 +431,7 @@ impl HeadlessServer {
             should_quit,
             server_event_rx,
             server_event_tx,
+            virtual_renderer: crate::server::render_stream::VirtualRenderer::new(),
         })
     }
 
@@ -3231,46 +3235,19 @@ impl HeadlessServer {
             let is_app_client = matches!(mode, ClientConnectionMode::App);
             let mut frame = match mode {
                 ClientConnectionMode::App => {
-                    let render_started = crate::render_prof::timer();
-                    let (buffer, cursor) =
+                    let effective_cell_size =
                         if self.app.state.kitty_graphics_enabled && cell_size.is_known() {
-                            crate::server::render_stream::render_virtual_with_runtime_registry(
-                                &mut self.app.state,
-                                &self.app.terminal_runtimes,
-                                area,
-                                is_foreground,
-                                cell_size,
-                            )
+                            cell_size
                         } else {
-                            crate::server::render_stream::render_virtual_with_runtime_registry(
-                                &mut self.app.state,
-                                &self.app.terminal_runtimes,
-                                area,
-                                is_foreground,
-                                crate::kitty_graphics::HostCellSize::default(),
-                            )
+                            crate::kitty_graphics::HostCellSize::default()
                         };
-                    crate::render_prof::duration_since(
-                        "full_render.render_virtual",
-                        render_started,
-                    );
-                    let hyperlinks_started = crate::render_prof::timer();
-                    let hyperlinks = crate::server::render_stream::visible_hyperlinks(
-                        &self.app.state,
+                    self.virtual_renderer.render_app_frame(
+                        &mut self.app.state,
                         &self.app.terminal_runtimes,
-                    );
-                    crate::render_prof::duration_since(
-                        "full_render.visible_hyperlinks",
-                        hyperlinks_started,
-                    );
-                    let frame_started = crate::render_prof::timer();
-                    let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
-                        &buffer,
-                        cursor,
-                        &hyperlinks,
-                    );
-                    crate::render_prof::duration_since("full_render.frame_build", frame_started);
-                    frame
+                        area,
+                        is_foreground,
+                        effective_cell_size,
+                    )
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id } => {
                     let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
@@ -4116,6 +4093,7 @@ mod tests {
             should_quit,
             server_event_rx,
             server_event_tx,
+            virtual_renderer: crate::server::render_stream::VirtualRenderer::new(),
         }
     }
 
@@ -4128,6 +4106,33 @@ mod tests {
         match read_server_message(bytes) {
             ServerMessage::Frame(frame) => frame,
             other => panic!("expected frame, got {other:?}"),
+        }
+    }
+
+    /// Stateful frame decoder mirroring the real client: tracks the last full
+    /// frame and reconstructs `FrameDiff` messages against it. Use one per
+    /// client receiver when a test reads more than the initial keyframe.
+    #[derive(Default)]
+    struct FrameSink {
+        baseline: Option<FrameData>,
+    }
+
+    impl FrameSink {
+        fn push(&mut self, bytes: Vec<u8>) -> FrameData {
+            let frame = match read_server_message(bytes) {
+                ServerMessage::Frame(frame) => frame,
+                ServerMessage::FrameDiff(diff) => {
+                    let mut frame = self
+                        .baseline
+                        .clone()
+                        .expect("FrameDiff received before any keyframe");
+                    assert!(frame.apply_diff(&diff), "diff must apply to baseline");
+                    frame
+                }
+                other => panic!("expected frame, got {other:?}"),
+            };
+            self.baseline = Some(frame.clone());
+            frame
         }
     }
 
@@ -6785,8 +6790,9 @@ next_tab = ""
     #[tokio::test]
     async fn retained_pty_update_streams_dirty_row_from_last_frame() {
         let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+        let mut sink = FrameSink::default();
         server.render_and_stream();
-        let first = read_server_frame(
+        let first = sink.push(
             client_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("initial frame"),
@@ -6801,7 +6807,7 @@ next_tab = ""
         runtime.test_process_pty_bytes(b"\rZ");
 
         assert!(server.render_retained_pty_update_and_stream());
-        let patched = read_server_frame(
+        let patched = sink.push(
             client_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained frame"),
@@ -6858,15 +6864,21 @@ next_tab = ""
         let update = b"\r\x1b[44mZ\x1b[0m";
         let (mut retained_server, retained_rx, retained_pane_id) = retained_test_server(initial);
         let (mut full_server, full_rx, full_pane_id) = retained_test_server(initial);
+        let mut retained_sink = FrameSink::default();
+        let mut full_sink = FrameSink::default();
 
         retained_server.render_and_stream();
-        let _ = retained_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial retained baseline");
+        let _ = retained_sink.push(
+            retained_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial retained baseline"),
+        );
         full_server.render_and_stream();
-        let _ = full_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial full baseline");
+        let _ = full_sink.push(
+            full_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial full baseline"),
+        );
 
         retained_server
             .app
@@ -6888,12 +6900,12 @@ next_tab = ""
         assert!(retained_server.render_retained_pty_update_and_stream());
         full_server.render_and_stream();
 
-        let retained_frame = read_server_frame(
+        let retained_frame = retained_sink.push(
             retained_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained frame"),
         );
-        let full_frame = read_server_frame(
+        let full_frame = full_sink.push(
             full_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("full frame"),
@@ -6907,15 +6919,21 @@ next_tab = ""
         let update = b"\x1b[D";
         let (mut retained_server, retained_rx, retained_pane_id) = retained_test_server(initial);
         let (mut full_server, full_rx, full_pane_id) = retained_test_server(initial);
+        let mut retained_sink = FrameSink::default();
+        let mut full_sink = FrameSink::default();
 
         retained_server.render_and_stream();
-        let _ = retained_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial retained baseline");
+        let _ = retained_sink.push(
+            retained_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial retained baseline"),
+        );
         full_server.render_and_stream();
-        let _ = full_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial full baseline");
+        let _ = full_sink.push(
+            full_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial full baseline"),
+        );
 
         retained_server
             .app
@@ -6937,12 +6955,12 @@ next_tab = ""
         assert!(retained_server.render_retained_pty_update_and_stream());
         full_server.render_and_stream();
 
-        let retained_frame = read_server_frame(
+        let retained_frame = retained_sink.push(
             retained_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained cursor frame"),
         );
-        let full_frame = read_server_frame(
+        let full_frame = full_sink.push(
             full_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("full cursor frame"),
@@ -6953,10 +6971,13 @@ next_tab = ""
     #[tokio::test]
     async fn retained_pty_update_declines_unsafe_mode_without_consuming_dirty_rows() {
         let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+        let mut sink = FrameSink::default();
         server.render_and_stream();
-        let _ = client_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial frame");
+        let _ = sink.push(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
 
         let runtime = server
             .app
@@ -6971,7 +6992,7 @@ next_tab = ""
 
         server.app.state.mode = crate::app::Mode::Terminal;
         assert!(server.render_retained_pty_update_and_stream());
-        let patched = read_server_frame(
+        let patched = sink.push(
             client_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained frame after safe mode"),
@@ -7030,6 +7051,15 @@ next_tab = ""
         assert!(!server.render_retained_pty_update_and_stream());
         assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
 
+        // This test commits a synthetic baseline directly to render_state that the
+        // client never received, so reset the baseline to force a full keyframe
+        // for the assertion below rather than an unappliable diff.
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .render_state
+            .reset_baseline();
         server.render_and_stream();
         let full = read_server_frame(
             client_rx
@@ -7051,10 +7081,13 @@ next_tab = ""
             height_px: 20,
         };
 
+        let mut sink = FrameSink::default();
         server.render_and_stream();
-        let _ = client_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("initial frame");
+        let _ = sink.push(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
 
         let runtime = server
             .app
@@ -7064,7 +7097,7 @@ next_tab = ""
         runtime.test_process_pty_bytes(b"\rZ");
 
         assert!(server.render_retained_pty_update_and_stream());
-        let retained = read_server_frame(
+        let retained = sink.push(
             client_rx
                 .recv_timeout(Duration::from_millis(100))
                 .expect("retained frame with kitty enabled"),

@@ -63,6 +63,12 @@ struct ClientLoopConfig {
 struct ClientState {
     /// Stateful semantic-frame encoder used when the server sends FrameData.
     blit_encoder: render_ansi::BlitEncoder,
+    /// When set, the next rendered frame is emitted to the host terminal in full
+    /// (not diffed against the prior host output). Used to recover the host
+    /// surface after focus regain or a resize without discarding the encoder's
+    /// frame baseline — discarding it would make an incoming `FrameDiff`
+    /// unappliable.
+    force_full_host_redraw: bool,
     /// Whether host mouse capture is currently active.
     mouse_capture_active: bool,
     /// The terminal size we reported to the server in our last Hello/Resize.
@@ -213,7 +219,10 @@ fn attach_scroll_action(
 
 impl ClientState {
     fn request_full_redraw(&mut self) {
-        self.blit_encoder = render_ansi::BlitEncoder::new();
+        // Force the next frame to be emitted to the host in full, but keep the
+        // encoder's frame baseline so an in-flight or subsequent `FrameDiff`
+        // still applies against the frame the server diffed from.
+        self.force_full_host_redraw = true;
     }
 }
 
@@ -996,6 +1005,7 @@ async fn run_client_loop(
 
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
+        force_full_host_redraw: false,
         mouse_capture_active: config.mouse_capture_active,
         reported_size: (cols, rows),
         sound_config: config.sound_config,
@@ -1183,7 +1193,37 @@ async fn run_client_loop(
             }
             ClientLoopEvent::ServerMessage(msg) => match msg {
                 ServerMessage::Frame(frame_data) => {
-                    let encoded = state.blit_encoder.encode(&frame_data, false);
+                    let force_full = std::mem::take(&mut state.force_full_host_redraw);
+                    let encoded = state.blit_encoder.encode(&frame_data, force_full);
+                    let mut stdout = io::stdout();
+                    let graphics = if state.kitty_graphics_enabled {
+                        frame_data.graphics.as_slice()
+                    } else {
+                        &[]
+                    };
+                    let _ =
+                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+                    let _ = stdout.flush();
+                    state.blit_encoder.commit(frame_data, encoded);
+                }
+                ServerMessage::FrameDiff(diff) => {
+                    // Reconstruct the full frame by patching the encoder's cached
+                    // baseline, then render it exactly like a full frame.
+                    let Some(mut frame_data) = state.blit_encoder.last_frame().cloned() else {
+                        // No baseline yet. The server only sends a diff once it has
+                        // sent a keyframe, so this should be unreachable; force a
+                        // full host redraw on the next frame to recover defensively.
+                        state.force_full_host_redraw = true;
+                        continue;
+                    };
+                    if !frame_data.apply_diff(&diff) {
+                        // Dimensions disagree with our baseline: desync. Recover on
+                        // the next keyframe rather than rendering a corrupt frame.
+                        state.force_full_host_redraw = true;
+                        continue;
+                    }
+                    let force_full = std::mem::take(&mut state.force_full_host_redraw);
+                    let encoded = state.blit_encoder.encode(&frame_data, force_full);
                     let mut stdout = io::stdout();
                     let graphics = if state.kitty_graphics_enabled {
                         frame_data.graphics.as_slice()

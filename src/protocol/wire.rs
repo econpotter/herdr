@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 14;
+///
+/// 15: added `ServerMessage::FrameDiff` for incremental semantic frame updates.
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -461,6 +463,92 @@ pub struct FrameData {
     pub graphics: Vec<u8>,
 }
 
+/// An incremental update to a semantic client's previously sent [`FrameData`].
+///
+/// Sent instead of a full `FrameData` when the server's last frame for a client
+/// has the same dimensions as the new frame, so only the rows that changed need
+/// to cross the wire. The client reconstructs the full frame by overwriting the
+/// listed rows of its cached baseline and replacing the cursor/hyperlinks/
+/// graphics wholesale (these are small relative to the cell grid).
+///
+/// `width`/`height` are echoed so the client can reject a diff that does not
+/// match its baseline dimensions (which would indicate a desync).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameDiffData {
+    /// Frame width in columns; must match the baseline frame.
+    pub width: u16,
+    /// Frame height in rows; must match the baseline frame.
+    pub height: u16,
+    /// Cursor state for the new frame.
+    pub cursor: Option<CursorState>,
+    /// Changed rows as `(row_index, full_width_row_cells)`. Each row vector has
+    /// exactly `width` cells.
+    pub rows: Vec<(u16, Vec<CellData>)>,
+    /// Full hyperlink URI table for the new frame.
+    pub hyperlinks: Vec<String>,
+    /// Kitty graphics protocol bytes for the new frame.
+    pub graphics: Vec<u8>,
+}
+
+impl FrameData {
+    /// Computes the changed rows of `self` relative to `prev`. Both frames must
+    /// have identical dimensions. Returns `(row_index, row_cells)` for every row
+    /// whose cells differ.
+    pub fn changed_rows(&self, prev: &FrameData) -> Vec<(u16, Vec<CellData>)> {
+        debug_assert_eq!(self.width, prev.width);
+        debug_assert_eq!(self.height, prev.height);
+        let width = usize::from(self.width);
+        let mut rows = Vec::new();
+        for y in 0..self.height {
+            let start = usize::from(y) * width;
+            let end = start + width;
+            if self.cells[start..end] != prev.cells[start..end] {
+                rows.push((y, self.cells[start..end].to_vec()));
+            }
+        }
+        rows
+    }
+
+    /// Builds a [`FrameDiffData`] describing the change from `prev` to `self`,
+    /// or `None` if the dimensions differ (caller must send a full frame).
+    pub fn diff_from(&self, prev: &FrameData) -> Option<FrameDiffData> {
+        if self.width != prev.width || self.height != prev.height {
+            return None;
+        }
+        Some(FrameDiffData {
+            width: self.width,
+            height: self.height,
+            cursor: self.cursor.clone(),
+            rows: self.changed_rows(prev),
+            hyperlinks: self.hyperlinks.clone(),
+            graphics: self.graphics.clone(),
+        })
+    }
+
+    /// Applies `diff` to `self` in place, reconstructing the new full frame.
+    /// Returns `false` (leaving `self` unchanged) if the diff dimensions do not
+    /// match `self`, or a row is malformed — both indicate a baseline desync.
+    #[must_use]
+    pub fn apply_diff(&mut self, diff: &FrameDiffData) -> bool {
+        if diff.width != self.width || diff.height != self.height {
+            return false;
+        }
+        let width = usize::from(self.width);
+        for (y, row) in &diff.rows {
+            if *y >= self.height || row.len() != width {
+                return false;
+            }
+            let start = usize::from(*y) * width;
+            let end = start + width;
+            self.cells[start..end].clone_from_slice(row);
+        }
+        self.cursor = diff.cursor.clone();
+        self.hyperlinks = diff.hyperlinks.clone();
+        self.graphics = diff.graphics.clone();
+        true
+    }
+}
+
 impl FrameData {
     /// Creates a `FrameData` from a ratatui `Buffer` and optional cursor.
     ///
@@ -645,6 +733,10 @@ pub enum ServerMessage {
         /// True when Herdr mouse UI is enabled or the focused pane app requests mouse reporting.
         enabled: bool,
     },
+
+    /// An incremental update to a semantic-frame client's previous [`FrameData`].
+    /// Only the changed rows cross the wire; the client patches its cached frame.
+    FrameDiff(FrameDiffData),
 }
 
 // ---------------------------------------------------------------------------

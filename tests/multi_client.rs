@@ -566,7 +566,7 @@ fn client_handshake(
 
 fn connect_raw_client(client_socket: &Path, cols: u16, rows: u16) -> UnixStream {
     let mut stream = UnixStream::connect(client_socket).expect("should connect to client socket");
-    client_handshake(&mut stream, 14, cols, rows).expect("handshake should succeed");
+    client_handshake(&mut stream, 15, cols, rows).expect("handshake should succeed");
     stream
 }
 
@@ -637,6 +637,67 @@ fn decode_frame_payload(payload: &[u8]) -> io::Result<FrameWire> {
         })
 }
 
+/// Wire mirror of `protocol::FrameDiffData` (ServerMessage::FrameDiff, variant 10).
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct FrameDiffWire {
+    width: u16,
+    height: u16,
+    cursor: Option<CursorWire>,
+    rows: Vec<(u16, Vec<CellWire>)>,
+    hyperlinks: Vec<String>,
+    graphics: Vec<u8>,
+}
+
+/// Variant index of `ServerMessage::FrameDiff` in the enum declaration order.
+const FRAME_DIFF_VARIANT: u32 = 10;
+
+fn decode_frame_diff_payload(payload: &[u8]) -> io::Result<FrameDiffWire> {
+    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+        .map(|(diff, _consumed): (FrameDiffWire, usize)| diff)
+}
+
+/// A blank frame of the given size, used to seed a baseline when a diff arrives
+/// before any keyframe (e.g. after a test drains the initial frame). Newly
+/// appeared content lands in the diff's changed rows, which is enough for
+/// "frame contains text" assertions.
+fn blank_frame(width: u16, height: u16) -> FrameWire {
+    let count = usize::from(width) * usize::from(height);
+    FrameWire {
+        cells: (0..count)
+            .map(|_| CellWire {
+                symbol: " ".to_string(),
+                fg: 0,
+                bg: 0,
+                modifier: 0,
+                skip: false,
+                hyperlink: None,
+            })
+            .collect(),
+        width,
+        height,
+        cursor: None,
+        hyperlinks: Vec::new(),
+        graphics: Vec::new(),
+    }
+}
+
+/// Reconstructs a full frame by applying a diff to the cached baseline, the same
+/// way the real client does.
+fn apply_frame_diff(base: &mut FrameWire, diff: FrameDiffWire) {
+    let width = base.width as usize;
+    for (y, row) in diff.rows {
+        let start = (y as usize) * width;
+        for (i, cell) in row.into_iter().enumerate() {
+            base.cells[start + i] = cell;
+        }
+    }
+    base.cursor = diff.cursor;
+    base.hyperlinks = diff.hyperlinks;
+    base.graphics = diff.graphics;
+}
+
 fn read_server_message_payload(
     stream: &mut UnixStream,
     timeout: Duration,
@@ -695,24 +756,32 @@ fn wait_for_frame_matching_with_snapshots(
 ) -> io::Result<(bool, Vec<String>)> {
     let deadline = Instant::now() + timeout;
     let mut snapshots = VecDeque::with_capacity(5);
+    let mut baseline: Option<FrameWire> = None;
     while Instant::now() < deadline {
         let slice = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(80));
         match read_server_message_payload(stream, slice) {
             Ok((1, frame_payload)) => {
-                let frame = decode_frame_payload(&frame_payload)?;
-                if snapshots.len() == 5 {
-                    snapshots.pop_front();
-                }
-                snapshots.push_back(frame_text(&frame));
-                if predicate(&frame) {
-                    return Ok((true, snapshots.into_iter().collect()));
-                }
+                baseline = Some(decode_frame_payload(&frame_payload)?);
             }
-            Ok((_variant, _payload)) => {}
-            Err(err) if is_timeout(&err) => {}
+            Ok((FRAME_DIFF_VARIANT, diff_payload)) => {
+                let diff = decode_frame_diff_payload(&diff_payload)?;
+                let base = baseline.get_or_insert_with(|| blank_frame(diff.width, diff.height));
+                apply_frame_diff(base, diff);
+            }
+            Ok((_variant, _payload)) => continue,
+            Err(err) if is_timeout(&err) => continue,
             Err(err) => return Err(err),
+        }
+        if let Some(frame) = baseline.as_ref() {
+            if snapshots.len() == 5 {
+                snapshots.pop_front();
+            }
+            snapshots.push_back(frame_text(frame));
+            if predicate(frame) {
+                return Ok((true, snapshots.into_iter().collect()));
+            }
         }
     }
 
