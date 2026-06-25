@@ -56,24 +56,66 @@ pub(crate) fn handoff_socket_path() -> PathBuf {
 }
 
 #[cfg(unix)]
+fn import_exe_or_current(import_exe: Option<&Path>) -> io::Result<PathBuf> {
+    match import_exe {
+        Some(path) => Ok(path.to_path_buf()),
+        None => std::env::current_exe().map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("failed to determine herdr executable path: {err}"),
+            )
+        }),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn validate_import_session_namespace(import_exe: Option<&Path>) -> io::Result<()> {
+    let exe = import_exe_or_current(import_exe)?;
+    let output = Command::new(&exe)
+        .arg("server")
+        .arg("--handoff-probe")
+        .output()
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to probe handoff import server at {}: {err}",
+                    exe.display()
+                ),
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            output.status.to_string()
+        } else {
+            format!("{}: {stderr}", output.status)
+        };
+        return Err(io::Error::other(format!(
+            "handoff import server probe failed for {}: {detail}",
+            exe.display()
+        )));
+    }
+    let import_data_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let source_data_dir = crate::session::data_dir();
+    if import_data_dir != source_data_dir.to_string_lossy() {
+        return Err(io::Error::other(format!(
+            "handoff import server uses a different session data directory: source={}, import={}; use a replacement binary with the same runtime namespace",
+            source_data_dir.display(),
+            import_data_dir
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 pub(crate) fn spawn_handoff_import(
     import_exe: Option<&Path>,
     socket_path: &Path,
     token: &str,
 ) -> io::Result<Child> {
-    let fallback_exe;
-    let exe = if let Some(import_exe) = import_exe {
-        import_exe
-    } else {
-        fallback_exe = std::env::current_exe().map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("failed to determine herdr executable path: {err}"),
-            )
-        })?;
-        &fallback_exe
-    };
-    let mut command = Command::new(exe);
+    let exe = import_exe_or_current(import_exe)?;
+    let mut command = Command::new(&exe);
     command
         .arg("server")
         .arg("--handoff-import")

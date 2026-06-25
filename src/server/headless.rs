@@ -872,6 +872,7 @@ impl HeadlessServer {
     ) -> io::Result<()> {
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
+        crate::server::handoff::validate_import_session_namespace(import_exe.as_deref())?;
         let socket_path = crate::server::handoff::handoff_socket_path();
         let token = format!(
             "{}-{}",
@@ -3941,6 +3942,10 @@ pub fn run_server() -> io::Result<()> {
     crate::platform::raise_server_nofile_limit();
 
     let args: Vec<String> = std::env::args().collect();
+    if args.get(2).map(String::as_str) == Some("--handoff-probe") {
+        println!("{}", crate::session::data_dir().display());
+        return Ok(());
+    }
     if args.get(2).map(String::as_str) == Some("--handoff-import") {
         let socket_path = args
             .get(3)
