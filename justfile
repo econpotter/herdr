@@ -41,6 +41,14 @@ install-hooks:
 build:
     cargo build --release --locked
 
+install-dir := env_var_or_default("HERDR_INSTALL_DIR", env_var("HOME") / ".local/bin")
+
+# Build and install the release binary (override: `just install-dir=/usr/local/bin install`)
+install: build
+    mkdir -p "{{install-dir}}"
+    install -m755 target/release/herdr "{{install-dir}}/herdr"
+    @echo "installed herdr to {{install-dir}}/herdr"
+
 # Runs in a dedicated `profile` herdr session (HERDR_SESSION=profile) so it gets
 # its own socket, data dir, and log and never collides with your normal running
 # herdr. Once per second the server logs a `render.prof` line (per-stage avg/max
