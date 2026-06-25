@@ -648,6 +648,21 @@ impl HeadlessServer {
 
             // 7. Render virtually and stream frames.
             if needs_render && self.app.can_render_now(now) {
+                // Under socket backpressure every render target already holds an
+                // unsent frame. Building another now is wasted work: it could not
+                // be delivered until the socket drains, and the pending pane state
+                // coalesces into the next frame. Defer until ClientWriterDrained
+                // frees a slot, owing the targets a frame so the drain re-renders.
+                if self.all_render_targets_slot_occupied() {
+                    crate::render_prof::event("render.deferred_slot_occupied");
+                    self.app.render_dirty.store(false, Ordering::Release);
+                    self.defer_render_until_slot_drains();
+                    needs_render = false;
+                    needs_full_render = false;
+                    chrome_only = false;
+                    pane_only_input = false;
+                    continue;
+                }
                 crate::render_prof::event("render.attempt");
                 let pty_dirty = self.app.render_dirty.swap(false, Ordering::AcqRel);
                 if pty_dirty {
@@ -1216,6 +1231,35 @@ impl HeadlessServer {
 
     fn has_app_client(&self) -> bool {
         self.app_client_count() > 0
+    }
+
+    /// Returns true when every client that would receive a frame this iteration
+    /// already has an unsent frame queued in its transport slot. Building another
+    /// frame now would be wasted; the loop defers instead.
+    fn all_render_targets_slot_occupied(&self) -> bool {
+        let targets = render_targets(&self.clients, self.foreground_client_id);
+        if targets.is_empty() {
+            return false;
+        }
+        targets.iter().all(|(client_id, ..)| {
+            self.clients
+                .get(client_id)
+                .is_some_and(|client| client.render_slot_occupied)
+        })
+    }
+
+    /// Marks every render-target client as owing a frame so the next
+    /// `ClientWriterDrained` re-triggers a render once its slot frees.
+    fn defer_render_until_slot_drains(&mut self) {
+        let target_ids: Vec<u64> = render_targets(&self.clients, self.foreground_client_id)
+            .into_iter()
+            .map(|(client_id, ..)| client_id)
+            .collect();
+        for client_id in target_ids {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.render_pending = true;
+            }
+        }
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
@@ -2741,6 +2785,12 @@ impl HeadlessServer {
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     return false;
                 };
+                // The socket consumed the queued frame, so the slot is free to
+                // accept the next (coalesced) frame.
+                client.render_slot_occupied = false;
+                // Re-render only when a frame is owed: either a send failed
+                // while the slot was full, or a render was deferred because the
+                // slot was occupied. Both set `render_pending`.
                 if client.render_pending {
                     client.render_pending = false;
                     true
@@ -3220,8 +3270,7 @@ impl HeadlessServer {
                         patch.rows.len() as u64,
                     );
                     if crate::render_prof::enabled() {
-                        let cells =
-                            patch.rows.iter().map(|(_, cells)| cells.len() as u64).sum();
+                        let cells = patch.rows.iter().map(|(_, cells)| cells.len() as u64).sum();
                         crate::render_prof::pane_counter(info.id, "retained.patch_cells", cells);
                     }
                     if dirty_patch_intersects_hyperlinks(&frame, info.inner_rect, &patch) {
@@ -3441,6 +3490,7 @@ impl HeadlessServer {
         match writer.render.try_send(serialized) {
             Ok(()) => {
                 client.render_pending = false;
+                client.render_slot_occupied = true;
                 client.render_state.commit_sent_frame(prepared);
                 crate::render_prof::event("retained_send.sent");
                 crate::render_prof::duration_since("retained_send.try_send", send_started);
@@ -3448,6 +3498,7 @@ impl HeadlessServer {
             }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 client.render_pending = true;
+                client.render_slot_occupied = true;
                 crate::render_prof::event("retained_send_fallback.queue_full");
                 crate::render_prof::duration_since("retained_send.try_send", send_started);
                 debug!(
@@ -3680,6 +3731,7 @@ impl HeadlessServer {
             match writer.render.try_send(serialized) {
                 Ok(()) => {
                     client.render_pending = false;
+                    client.render_slot_occupied = true;
                     if commit_graphics_cache {
                         client.graphics_cache = next_graphics_cache;
                         client.graphics_surface_reset_pending = false;
@@ -3690,6 +3742,7 @@ impl HeadlessServer {
                 }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                     client.render_pending = true;
+                    client.render_slot_occupied = true;
                     deferred_frame = true;
                     crate::render_prof::event("full_render.queue_full");
                     crate::render_prof::duration_since("full_render.try_send", send_started);
@@ -6984,6 +7037,50 @@ next_tab = ""
         assert!(matches!(
             read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
             ServerMessage::Frame(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn render_slot_gate_defers_while_queue_full_and_recovers_on_drain() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+
+        // Initial frame fills the single-slot render channel, marking the slot
+        // occupied so the loop would defer further renders.
+        server.render_and_stream();
+        assert!(server.clients.get(&1).unwrap().render_slot_occupied);
+        assert!(
+            server.all_render_targets_slot_occupied(),
+            "slot must read as occupied while a frame is queued"
+        );
+
+        // New pane output arrives while the slot is occupied. The run loop would
+        // skip the build and owe the target a frame instead.
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(b"\rZ");
+        server.defer_render_until_slot_drains();
+        assert!(server.clients.get(&1).unwrap().render_pending);
+
+        // The socket consumes the queued frame and reports the drain.
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(50))
+            .expect("queued frame");
+        assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 1 }));
+
+        // Slot is free again and the deferred render is owed.
+        assert!(!server.clients.get(&1).unwrap().render_slot_occupied);
+        assert!(!server.clients.get(&1).unwrap().render_pending);
+        assert!(!server.all_render_targets_slot_occupied());
+
+        // The owed render delivers the coalesced pane state (the new "Z" output)
+        // as an incremental diff against the previously committed frame.
+        server.render_and_stream();
+        assert!(matches!(
+            read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()),
+            ServerMessage::Frame(_) | ServerMessage::FrameDiff(_)
         ));
     }
 

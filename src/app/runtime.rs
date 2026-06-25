@@ -890,8 +890,7 @@ mod tests {
 
         assert!(!changed, "no-op refresh must not report a change");
         assert!(
-            !app.render_dirty
-                .load(std::sync::atomic::Ordering::Acquire),
+            !app.render_dirty.load(std::sync::atomic::Ordering::Acquire),
             "no-op refresh must not mark the frame dirty"
         );
         assert!(!app.git_refresh_in_flight);

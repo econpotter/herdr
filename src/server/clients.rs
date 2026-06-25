@@ -51,6 +51,12 @@ pub(crate) struct ClientConnection {
     pub(crate) graphics_surface_reset_pending: bool,
     /// Whether a render was skipped because the render channel was full.
     pub(crate) render_pending: bool,
+    /// Whether the transport render slot currently holds a frame that has not
+    /// yet been written to the socket. While occupied, the server skips
+    /// building newer frames for this client: they could not be delivered until
+    /// the socket drains, and the accumulated pane state coalesces into a single
+    /// patch once `ClientWriterDrained` frees the slot.
+    pub(crate) render_slot_occupied: bool,
     /// Last host mouse capture mode sent to this client.
     pub(crate) host_mouse_capture_active: Option<crate::protocol::HostMouseCaptureMode>,
     /// Temporary files staged from this client's local clipboard image pastes.
@@ -114,6 +120,7 @@ impl ClientConnection {
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
             graphics_surface_reset_pending: false,
             render_pending: false,
+            render_slot_occupied: false,
             host_mouse_capture_active: None,
             staged_clipboard_files: Vec::new(),
             writer,
