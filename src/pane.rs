@@ -59,6 +59,21 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     cmd.env("COLORTERM", PANE_COLORTERM);
 }
 
+fn notify_render_if_new(
+    pane_id: PaneId,
+    render_dirty: &AtomicBool,
+    render_notify: &Notify,
+    sent_metric: &'static str,
+    coalesced_metric: &'static str,
+) {
+    if render_dirty.swap(true, Ordering::AcqRel) {
+        crate::render_prof::pane_event(pane_id, coalesced_metric);
+    } else {
+        crate::render_prof::pane_event(pane_id, sent_metric);
+        render_notify.notify_one();
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
@@ -1671,17 +1686,27 @@ impl PaneRuntime {
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 observe_detection_content_change(bytes, &detection_content_seq);
-                if result.request_render && !render_dirty.swap(true, Ordering::AcqRel) {
-                    render_notify.notify_one();
+                if result.request_render {
+                    notify_render_if_new(
+                        pane_id,
+                        &render_dirty,
+                        &render_notify,
+                        "pty.render_notify_sent",
+                        "pty.render_notify_coalesced",
+                    );
                 }
                 if let Some(delay) = result.render_delay {
                     let render_notify = render_notify.clone();
                     let render_dirty = render_dirty.clone();
                     delay_rt.spawn(async move {
                         tokio::time::sleep(delay).await;
-                        if !render_dirty.swap(true, Ordering::AcqRel) {
-                            render_notify.notify_one();
-                        }
+                        notify_render_if_new(
+                            pane_id,
+                            &render_dirty,
+                            &render_notify,
+                            "pty.delayed_render_notify_sent",
+                            "pty.delayed_render_notify_coalesced",
+                        );
                     });
                 }
                 if let Some(cwd) = result.reported_cwd.clone() {
@@ -1826,17 +1851,27 @@ impl PaneRuntime {
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 observe_detection_content_change(bytes, &detection_content_seq);
-                if result.request_render && !render_dirty.swap(true, Ordering::AcqRel) {
-                    render_notify.notify_one();
+                if result.request_render {
+                    notify_render_if_new(
+                        pane_id,
+                        &render_dirty,
+                        &render_notify,
+                        "pty.render_notify_sent",
+                        "pty.render_notify_coalesced",
+                    );
                 }
                 if let Some(delay) = result.render_delay {
                     let render_notify = render_notify.clone();
                     let render_dirty = render_dirty.clone();
                     rt.spawn(async move {
                         tokio::time::sleep(delay).await;
-                        if !render_dirty.swap(true, Ordering::AcqRel) {
-                            render_notify.notify_one();
-                        }
+                        notify_render_if_new(
+                            pane_id,
+                            &render_dirty,
+                            &render_notify,
+                            "pty.delayed_render_notify_sent",
+                            "pty.delayed_render_notify_coalesced",
+                        );
                     });
                 }
                 if let Some(cwd) = result.reported_cwd.clone() {

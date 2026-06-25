@@ -711,10 +711,12 @@ impl HeadlessServer {
             match event {
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
+                    let cause = Self::internal_event_render_cause(&ev);
                     if self.handle_internal_event_with_forwarding(ev) {
                         needs_render = true;
                         needs_full_render = true;
                         crate::render_prof::event("full_render_cause.select_internal");
+                        crate::render_prof::event(cause);
                     }
                 }
                 LoopEvent::Api(msg) => {
@@ -1371,6 +1373,48 @@ impl HeadlessServer {
             }
         }
         (changed, requires_full)
+    }
+
+    fn internal_event_render_cause(ev: &AppEvent) -> &'static str {
+        match ev {
+            AppEvent::PaneDied { .. } => "full_render_cause.internal_event.pane_died",
+            AppEvent::StateChanged { .. } => "full_render_cause.internal_event.state_changed",
+            AppEvent::HookStateReported { .. } => {
+                "full_render_cause.internal_event.hook_state_reported"
+            }
+            AppEvent::AgentSessionReported { .. } => {
+                "full_render_cause.internal_event.agent_session_reported"
+            }
+            AppEvent::HookMetadataReported { .. } => {
+                "full_render_cause.internal_event.hook_metadata_reported"
+            }
+            AppEvent::HookAuthorityCleared { .. } => {
+                "full_render_cause.internal_event.hook_authority_cleared"
+            }
+            AppEvent::HookAgentReleased { .. } => {
+                "full_render_cause.internal_event.hook_agent_released"
+            }
+            AppEvent::UpdateReady { .. } => "full_render_cause.internal_event.update_ready",
+            AppEvent::AgentDetectionManifestsUpdated { .. } => {
+                "full_render_cause.internal_event.agent_detection_manifests_updated"
+            }
+            AppEvent::ClipboardWrite { .. } => "full_render_cause.internal_event.clipboard_write",
+            AppEvent::TerminalCwdReported { .. } => {
+                "full_render_cause.internal_event.terminal_cwd_reported"
+            }
+            AppEvent::GitStatusRefreshed { .. } => {
+                "full_render_cause.internal_event.git_status_refreshed"
+            }
+            AppEvent::PluginCommandFinished { .. } => {
+                "full_render_cause.internal_event.plugin_command_finished"
+            }
+            AppEvent::WorktreeAddFinished(_) => {
+                "full_render_cause.internal_event.worktree_add_finished"
+            }
+            AppEvent::WorktreeRemoveFinished(_) => {
+                "full_render_cause.internal_event.worktree_remove_finished"
+            }
+        }
     }
 
     fn terminal_id_by_string(&self, terminal_id: &str) -> Option<crate::terminal::TerminalId> {
@@ -2063,8 +2107,12 @@ impl HeadlessServer {
             let Ok(ev) = self.app.event_rx.try_recv() else {
                 break;
             };
+            let cause = Self::internal_event_render_cause(&ev);
             had_event = true;
-            changed |= self.handle_internal_event_with_forwarding(ev);
+            if self.handle_internal_event_with_forwarding(ev) {
+                changed = true;
+                crate::render_prof::event(cause);
+            }
         }
         (had_event, changed)
     }
@@ -2367,6 +2415,14 @@ impl HeadlessServer {
             && !selection_active_before
             && mode_before == app::Mode::Terminal
             && self.app.state.mode == app::Mode::Terminal;
+        self.profile_pane_input_retained_gate(
+            only_pane_forwarded,
+            host_surface_redraw,
+            foreground_changed,
+            theme_changed,
+            selection_active_before,
+            mode_before,
+        );
 
         if self.app.state.detach_requested {
             self.app.state.detach_requested = false;
@@ -2387,6 +2443,47 @@ impl HeadlessServer {
             false
         } else {
             foreground_changed || theme_changed || interaction
+        }
+    }
+
+    fn profile_pane_input_retained_gate(
+        &self,
+        only_pane_forwarded: bool,
+        host_surface_redraw: bool,
+        foreground_changed: bool,
+        theme_changed: bool,
+        selection_active_before: bool,
+        mode_before: app::Mode,
+    ) {
+        if !crate::render_prof::enabled() {
+            return;
+        }
+        if self.input_render_pane_only {
+            crate::render_prof::event("pane_input_retained.allowed");
+            return;
+        }
+
+        crate::render_prof::event("pane_input_retained.blocked");
+        if !only_pane_forwarded {
+            crate::render_prof::event("pane_input_retained.blocked.not_only_forwarded");
+        }
+        if host_surface_redraw {
+            crate::render_prof::event("pane_input_retained.blocked.host_surface_redraw");
+        }
+        if foreground_changed {
+            crate::render_prof::event("pane_input_retained.blocked.foreground_changed");
+        }
+        if theme_changed {
+            crate::render_prof::event("pane_input_retained.blocked.theme_changed");
+        }
+        if selection_active_before {
+            crate::render_prof::event("pane_input_retained.blocked.selection_active");
+        }
+        if mode_before != app::Mode::Terminal {
+            crate::render_prof::event("pane_input_retained.blocked.mode_before");
+        }
+        if self.app.state.mode != app::Mode::Terminal {
+            crate::render_prof::event("pane_input_retained.blocked.mode_after");
         }
     }
 
@@ -3096,16 +3193,37 @@ impl HeadlessServer {
             ) else {
                 retained_fallback!("missing_runtime");
             };
-            match runtime.collect_dirty_patch(info.inner_rect.width, info.inner_rect.height) {
+            let collect_started = crate::render_prof::timer();
+            let dirty_patch =
+                runtime.collect_dirty_patch(info.inner_rect.width, info.inner_rect.height);
+            crate::render_prof::pane_duration_since(
+                info.id,
+                "retained.collect_dirty",
+                collect_started,
+            );
+            match dirty_patch {
                 crate::pane::TerminalDirtyPatchOutcome::Clean => {
                     crate::render_prof::event("retained.pane_clean");
+                    crate::render_prof::pane_event(info.id, "retained.pane_clean");
                 }
                 crate::pane::TerminalDirtyPatchOutcome::Fallback => {
+                    crate::render_prof::pane_event(info.id, "retained.pane_fallback");
                     retained_fallback!("dirty_patch_fallback");
                 }
                 crate::pane::TerminalDirtyPatchOutcome::Patch(patch) => {
                     crate::render_prof::event("retained.pane_patch");
+                    crate::render_prof::pane_event(info.id, "retained.pane_patch");
                     crate::render_prof::counter("retained.patch_rows", patch.rows.len() as u64);
+                    crate::render_prof::pane_counter(
+                        info.id,
+                        "retained.patch_rows",
+                        patch.rows.len() as u64,
+                    );
+                    if crate::render_prof::enabled() {
+                        let cells =
+                            patch.rows.iter().map(|(_, cells)| cells.len() as u64).sum();
+                        crate::render_prof::pane_counter(info.id, "retained.patch_cells", cells);
+                    }
                     if dirty_patch_intersects_hyperlinks(&frame, info.inner_rect, &patch) {
                         retained_fallback!("hyperlink_intersection");
                     }

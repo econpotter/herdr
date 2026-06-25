@@ -486,7 +486,9 @@ impl GhosttyPaneTerminal {
         bytes: &[u8],
         _response_writer: &mpsc::Sender<Bytes>,
     ) -> ProcessBytesResult {
+        let process_started = crate::render_prof::timer();
         crate::render_prof::counter("pty.bytes", bytes.len() as u64);
+        crate::render_prof::pane_counter(pane_id, "pty.bytes", bytes.len() as u64);
         let Ok(mut core) = self.core.lock() else {
             error!(pane = pane_id.raw(), "ghostty core lock poisoned in reader");
             return ProcessBytesResult {
@@ -566,6 +568,7 @@ impl GhosttyPaneTerminal {
             &mut terminal_responses,
         );
         crate::render_prof::duration_since("pty.ghostty_write", write_started);
+        crate::render_prof::pane_duration_since(pane_id, "pty.ghostty_write", write_started);
 
         let has_kitty_graphics_sequence = crate::kitty_graphics::is_enabled()
             && contains_kitty_graphics_sequence(filtered_bytes.as_ref());
@@ -595,13 +598,17 @@ impl GhosttyPaneTerminal {
         );
         if request_render {
             crate::render_prof::event("pty.request_render");
+            crate::render_prof::pane_event(pane_id, "pty.request_render");
         }
         if render_delay.is_some() {
             crate::render_prof::event("pty.request_render_delayed");
+            crate::render_prof::pane_event(pane_id, "pty.request_render_delayed");
         }
         if synchronized_output {
             crate::render_prof::event("pty.synchronized_output_suppressed");
+            crate::render_prof::pane_event(pane_id, "pty.synchronized_output_suppressed");
         }
+        crate::render_prof::pane_duration_since(pane_id, "pty.process_bytes", process_started);
         ProcessBytesResult {
             request_render,
             render_delay,
