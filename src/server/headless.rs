@@ -2001,6 +2001,19 @@ impl HeadlessServer {
 
                 true
             }
+            AppEvent::GitStatusRefreshed { .. } => {
+                // Periodic git status refreshes are usually no-ops. Only signal a
+                // render (which forces a full repaint to update the sidebar) when
+                // the visible branch/ahead-behind/space actually changed.
+                let AppEvent::GitStatusRefreshed {
+                    results,
+                    cache_updates,
+                } = ev
+                else {
+                    unreachable!("matched GitStatusRefreshed");
+                };
+                self.app.handle_git_status_refreshed(results, cache_updates)
+            }
             _ => {
                 self.app.handle_internal_event(ev);
                 true

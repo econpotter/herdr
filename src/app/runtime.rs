@@ -514,6 +514,40 @@ impl App {
         });
     }
 
+    /// Applies a completed background git status refresh and returns whether the
+    /// visible git status actually changed.
+    ///
+    /// Returning `false` lets the headless render loop avoid a full render (which
+    /// would otherwise repaint the sidebar) when a periodic refresh produced the
+    /// same branch/ahead-behind/space as before. The vast majority of refreshes
+    /// are no-ops, so gating on real change removes the dominant source of
+    /// avoidable full renders.
+    pub(crate) fn handle_git_status_refreshed(
+        &mut self,
+        results: Vec<WorkspaceGitStatus>,
+        cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
+    ) -> bool {
+        self.git_refresh_in_flight = false;
+        for (key, entry) in cache_updates {
+            self.git_status_cache.insert(key, entry);
+        }
+        if self.git_refresh_due_after_in_flight {
+            self.mark_git_status_refresh_due(Instant::now());
+            self.git_refresh_due_after_in_flight = false;
+        } else {
+            self.last_git_remote_status_refresh = Instant::now();
+        }
+        let changed = self
+            .state
+            .apply_workspace_git_statuses(&self.terminal_runtimes, results);
+        if changed {
+            self.render_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.render_notify.notify_one();
+        }
+        changed
+    }
+
     pub(crate) fn mark_git_status_refresh_due(&mut self, now: Instant) {
         if self.git_refresh_in_flight {
             self.git_refresh_due_after_in_flight = true;
@@ -835,6 +869,32 @@ mod tests {
             .git_refresh_deadline()
             .expect("refresh should be due once a workspace exists");
         assert!(deadline <= Instant::now());
+    }
+
+    #[test]
+    fn git_status_refresh_without_visible_change_does_not_request_render() {
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces.push(Workspace::test_new("test"));
+        app.git_refresh_in_flight = true;
+        app.render_dirty
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        // Empty results match an unknown workspace id, so nothing visible changes.
+        let changed = app.handle_git_status_refreshed(Vec::new(), Vec::new());
+
+        assert!(!changed, "no-op refresh must not report a change");
+        assert!(
+            !app.render_dirty
+                .load(std::sync::atomic::Ordering::Acquire),
+            "no-op refresh must not mark the frame dirty"
+        );
+        assert!(!app.git_refresh_in_flight);
     }
 
     #[test]
