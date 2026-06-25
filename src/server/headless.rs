@@ -2391,6 +2391,7 @@ impl HeadlessServer {
                 RawInputEvent::OuterFocusLost => "input_kind.focus_lost",
                 RawInputEvent::HostDefaultColor { .. } => "input_kind.host_color",
                 RawInputEvent::HostColorSchemeChanged(_) => "input_kind.color_scheme",
+                RawInputEvent::HostSynchronizedOutputReport(_) => "input_kind.sync_output_report",
                 RawInputEvent::Unsupported => "input_kind.unsupported",
             };
             crate::render_prof::event(kind);
@@ -6830,6 +6831,7 @@ next_tab = ""
             ),
         );
         server.foreground_client_id = Some(1);
+        server.app.state.redraw_on_focus_gained = true;
 
         server.render_and_stream();
         let _ = client_rx
@@ -6987,6 +6989,7 @@ next_tab = ""
     #[tokio::test]
     async fn outer_focus_gained_client_render_pending_survives_semantic_render_queue_full() {
         let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+        server.app.state.redraw_on_focus_gained = true;
 
         server.render_and_stream();
         let _ = client_rx

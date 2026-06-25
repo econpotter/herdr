@@ -599,7 +599,10 @@ impl App {
             mouse_capture: config.ui.mouse_capture,
             right_click_passthrough_modifiers: config.ui.right_click_passthrough_modifiers(),
             right_click_passthrough: None,
-            redraw_on_focus_gained: config.ui.redraw_on_focus_gained,
+            // Server-side resolution: the host-2026 auto path lives in the
+            // client (it owns the terminal), so the server honors an explicit
+            // value and treats "unset" as off.
+            redraw_on_focus_gained: config.ui.redraw_on_focus_gained.unwrap_or(false),
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
@@ -1327,10 +1330,12 @@ impl App {
                     .sidebar_width
                     .clamp(self.state.sidebar_min_width, self.state.sidebar_max_width);
                 self.state.mouse_capture = config.ui.mouse_capture;
-                if self.state.redraw_on_focus_gained != config.ui.redraw_on_focus_gained {
+                let resolved_redraw_on_focus_gained =
+                    config.ui.redraw_on_focus_gained.unwrap_or(false);
+                if self.state.redraw_on_focus_gained != resolved_redraw_on_focus_gained {
                     self.state.request_client_config_reload = true;
                 }
-                self.state.redraw_on_focus_gained = config.ui.redraw_on_focus_gained;
+                self.state.redraw_on_focus_gained = resolved_redraw_on_focus_gained;
                 self.state.mouse_scroll_lines = config.ui.mouse_scroll_lines();
                 self.state.right_click_passthrough_modifiers =
                     config.ui.right_click_passthrough_modifiers();
@@ -1584,6 +1589,10 @@ impl App {
                     if apply_host_terminal_theme {
                         self.set_host_terminal_appearance(appearance, true);
                     }
+                }
+                // Host capability metadata, not pane input: do not forward it.
+                crate::raw_input::RawInputEvent::HostSynchronizedOutputReport(_) => {
+                    only_pane_forwarded = false;
                 }
                 crate::raw_input::RawInputEvent::Unsupported => {}
             }
@@ -2224,7 +2233,7 @@ mod tests {
     #[test]
     fn startup_uses_redraw_on_focus_gained_config() {
         let mut config = Config::default();
-        config.ui.redraw_on_focus_gained = false;
+        config.ui.redraw_on_focus_gained = Some(false);
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
@@ -2424,6 +2433,9 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
+        // Start enabled so the reload to `false` is an observable change that
+        // requests a client config reload.
+        app.state.redraw_on_focus_gained = true;
         app.next_auto_update_check = Some(Instant::now());
         app.next_agent_manifest_update_check = Some(Instant::now());
         let report = app.reload_config();

@@ -56,7 +56,7 @@ static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::ne
 struct ClientLoopConfig {
     sound_config: crate::config::SoundConfig,
     mouse_scroll_lines: usize,
-    redraw_on_focus_gained: bool,
+    redraw_on_focus_gained: Option<bool>,
     kitty_graphics_enabled: bool,
     mouse_capture_active: crate::protocol::HostMouseCaptureMode,
     #[cfg(unix)]
@@ -90,7 +90,36 @@ struct ClientState {
     #[cfg(unix)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     /// Whether outer focus gain should force a full host-terminal redraw.
-    redraw_on_focus_gained: bool,
+    /// `None` means auto: decide from `host_supports_synchronized_output`.
+    redraw_on_focus_gained: Option<bool>,
+    /// Host terminal's reported support for synchronized output (DEC 2026),
+    /// learned from the startup DECRQM reply. `None` until the host answers (or
+    /// never, if it does not). Drives the auto focus-redraw decision so a
+    /// terminal that cannot swap the repaint atomically does not tear.
+    host_supports_synchronized_output: Option<bool>,
+}
+
+impl ClientState {
+    /// Resolves whether a focus-gain should force a full host repaint:
+    /// an explicit config value wins; otherwise auto-enable only when the host
+    /// confirmed synchronized-output support.
+    fn force_focus_redraw(&self) -> bool {
+        resolve_focus_redraw(
+            self.redraw_on_focus_gained,
+            self.host_supports_synchronized_output,
+        )
+    }
+
+    /// Records any host-capability reports carried in a batch of input events,
+    /// such as the DECRPM reply to the startup synchronized-output query.
+    fn absorb_host_capability_reports(&mut self, events: &[crate::raw_input::RawInputEvent]) {
+        for event in events {
+            if let crate::raw_input::RawInputEvent::HostSynchronizedOutputReport(supported) = event
+            {
+                self.host_supports_synchronized_output = Some(*supported);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1044,6 +1073,7 @@ async fn run_client_loop(
         #[cfg(unix)]
         remote_image_paste_key: config.remote_image_paste_key,
         redraw_on_focus_gained: config.redraw_on_focus_gained,
+        host_supports_synchronized_output: None,
     };
     debug!(?negotiated_encoding, "client render encoding active");
 
@@ -1061,6 +1091,9 @@ async fn run_client_loop(
 
     if will_query_host_terminal_theme {
         query_host_terminal_theme();
+        // Ask whether the host applies synchronized output (DEC 2026) so the
+        // auto focus-redraw path can avoid tearing on terminals that do not.
+        query_host_synchronized_output_support();
     }
 
     // Spawn the resize poller thread.
@@ -1143,9 +1176,10 @@ async fn run_client_loop(
                     }
                 } else {
                     let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+                    state.absorb_host_capability_reports(&events);
                     if crate::raw_input::events_require_host_surface_redraw(
                         &events,
-                        state.redraw_on_focus_gained,
+                        state.force_focus_redraw(),
                     ) {
                         state.request_full_redraw();
                     }
@@ -1196,9 +1230,10 @@ async fn run_client_loop(
                     .iter()
                     .map(crate::protocol::ClientInputEvent::to_raw_input_event)
                     .collect::<Vec<_>>();
+                state.absorb_host_capability_reports(&raw_events);
                 if crate::raw_input::events_require_host_surface_redraw(
                     &raw_events,
-                    state.redraw_on_focus_gained,
+                    state.force_focus_redraw(),
                 ) {
                     state.request_full_redraw();
                 }
@@ -1425,7 +1460,7 @@ fn client_remote_image_paste_key(
 
 fn reload_local_client_config(
     sound_config: &mut crate::config::SoundConfig,
-    redraw_on_focus_gained: &mut bool,
+    redraw_on_focus_gained: &mut Option<bool>,
     #[cfg(unix)] remote_image_paste_key: &mut Option<(
         crossterm::event::KeyCode,
         crossterm::event::KeyModifiers,
@@ -1733,6 +1768,27 @@ fn should_query_host_terminal_theme() -> bool {
     !cfg!(windows)
 }
 
+/// Resolves whether focus-gain forces a full host repaint: an explicit config
+/// value wins; an unset value auto-enables only when the host confirmed
+/// synchronized-output support (so non-2026 terminals never tear on refocus).
+fn resolve_focus_redraw(config: Option<bool>, host_supports_sync_output: Option<bool>) -> bool {
+    match config {
+        Some(value) => value,
+        None => host_supports_sync_output == Some(true),
+    }
+}
+
+fn query_host_synchronized_output_support() {
+    let _ = write_host_synchronized_output_query(io::stdout());
+}
+
+/// Sends a DECRQM request for DEC private mode 2026 (synchronized output):
+/// `CSI ? 2026 $ p`. A conforming terminal replies with a DECRPM report.
+fn write_host_synchronized_output_query(mut writer: impl io::Write) -> io::Result<()> {
+    writer.write_all(b"\x1b[?2026$p")?;
+    writer.flush()
+}
+
 fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()> {
     writer.write_all(crate::terminal_theme::HOST_COLOR_QUERY_SEQUENCE.as_bytes())?;
     writer.flush()
@@ -1882,6 +1938,26 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("a=d,d=I,i=123"));
         assert!(!text.contains("d=A"));
+    }
+
+    #[test]
+    fn write_host_synchronized_output_query_emits_decrqm() {
+        let mut output = Vec::new();
+        write_host_synchronized_output_query(&mut output).unwrap();
+        assert_eq!(output, b"\x1b[?2026$p");
+    }
+
+    #[test]
+    fn resolve_focus_redraw_honors_explicit_then_auto_detects() {
+        // Explicit config always wins, regardless of host capability.
+        assert!(resolve_focus_redraw(Some(true), Some(false)));
+        assert!(resolve_focus_redraw(Some(true), None));
+        assert!(!resolve_focus_redraw(Some(false), Some(true)));
+
+        // Auto (unset): only when the host confirmed 2026 support.
+        assert!(resolve_focus_redraw(None, Some(true)));
+        assert!(!resolve_focus_redraw(None, Some(false)));
+        assert!(!resolve_focus_redraw(None, None));
     }
 
     #[test]
@@ -2232,7 +2308,7 @@ mod tests {
         let path_string = path.to_string_lossy().to_string();
         let _env = EnvVarGuard::set(crate::config::CONFIG_PATH_ENV_VAR, &path_string);
         let mut sound_config = crate::config::SoundConfig::default();
-        let mut redraw_on_focus_gained = true;
+        let mut redraw_on_focus_gained = Some(true);
         #[cfg(unix)]
         let mut remote_image_paste_key = None;
 
@@ -2243,7 +2319,7 @@ mod tests {
             &mut remote_image_paste_key,
         );
 
-        assert!(!redraw_on_focus_gained);
+        assert_eq!(redraw_on_focus_gained, Some(false));
         let _ = std::fs::remove_file(path);
     }
 

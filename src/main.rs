@@ -258,8 +258,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # right_click_passthrough_modifier = ""
 
 # Force a full redraw when the outer terminal regains focus.
-# Set false to reduce visible flashing when switching back to Herdr.
-# Trade-off: rare host terminal surface corruption may persist until the next full redraw.
+# Unset (default) auto-enables this only when the host terminal supports
+# synchronized output, so terminals that cannot repaint atomically do not flash.
+# Set true to always redraw (recovers rare host surface corruption, may flash on
+# terminals without synchronized output); set false to never redraw.
 # redraw_on_focus_gained = true
 
 # Pane scrollback lines to scroll per mouse wheel notch.

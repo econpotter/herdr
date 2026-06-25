@@ -177,6 +177,9 @@ impl App {
                 self.query_host_terminal_theme();
                 self.set_host_terminal_appearance(appearance, true)
             }
+            // Host synchronized-output support is resolved client-side; the
+            // monolithic path keeps its explicit/resolved focus-redraw setting.
+            crate::raw_input::RawInputEvent::HostSynchronizedOutputReport(_) => false,
             crate::raw_input::RawInputEvent::Unsupported => false,
         };
         self.sync_prefix_input_source(previous_mode);

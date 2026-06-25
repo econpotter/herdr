@@ -767,8 +767,11 @@ pub struct UiConfig {
     pub mouse_capture: bool,
     /// Modifier that lets right-click gestures pass through to pane apps. Empty disables it.
     pub right_click_passthrough_modifier: RightClickPassthroughModifierConfig,
-    /// Force a full host-terminal redraw when the outer terminal regains focus. Default: true.
-    pub redraw_on_focus_gained: bool,
+    /// Force a full host-terminal redraw when the outer terminal regains focus.
+    /// Unset (the default) auto-enables it only when the host terminal reports
+    /// synchronized-output (DEC 2026) support, so terminals that cannot apply
+    /// the repaint atomically do not visibly tear. `true`/`false` force it on/off.
+    pub redraw_on_focus_gained: Option<bool>,
     /// Lines to scroll per mouse wheel notch. Default: 3.
     pub mouse_scroll_lines: Option<NonZeroUsize>,
     /// Ask for confirmation before closing a workspace. Default: true.
@@ -964,7 +967,7 @@ impl Default for UiConfig {
             mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
             mouse_capture: true,
             right_click_passthrough_modifier: RightClickPassthroughModifierConfig::default(),
-            redraw_on_focus_gained: true,
+            redraw_on_focus_gained: None,
             mouse_scroll_lines: None,
             confirm_close: true,
             prompt_new_tab_name: true,
@@ -1403,16 +1406,16 @@ right_click_passthrough_modifier = "{value}"
     }
 
     #[test]
-    fn redraw_on_focus_gained_default_on_and_parse() {
+    fn redraw_on_focus_gained_defaults_to_auto_and_parses_explicit() {
+        // Unset means auto-detect (None), not a hardcoded on/off.
         let default_config = Config::default();
-        assert!(default_config.ui.redraw_on_focus_gained);
+        assert_eq!(default_config.ui.redraw_on_focus_gained, None);
 
-        let toml = r#"
-[ui]
-redraw_on_focus_gained = false
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(!config.ui.redraw_on_focus_gained);
+        let off: Config = toml::from_str("[ui]\nredraw_on_focus_gained = false\n").unwrap();
+        assert_eq!(off.ui.redraw_on_focus_gained, Some(false));
+
+        let on: Config = toml::from_str("[ui]\nredraw_on_focus_gained = true\n").unwrap();
+        assert_eq!(on.ui.redraw_on_focus_gained, Some(true));
     }
 
     #[test]

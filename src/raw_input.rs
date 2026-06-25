@@ -117,6 +117,9 @@ pub enum RawInputEvent {
         color: RgbColor,
     },
     HostColorSchemeChanged(HostAppearance),
+    /// The host terminal reported whether it supports synchronized output
+    /// (DEC private mode 2026) via a DECRPM reply. `true` means recognized.
+    HostSynchronizedOutputReport(bool),
     Unsupported,
 }
 
@@ -398,6 +401,18 @@ pub(crate) fn events_require_host_terminal_theme_query(events: &[RawInputEvent])
         .any(|event| matches!(event, RawInputEvent::HostColorSchemeChanged(_)))
 }
 
+/// Parses a DECRPM reply for synchronized output (DEC private mode 2026):
+/// `CSI ? 2026 ; Ps $ y`. Returns whether the host recognizes the mode
+/// (`Ps == 0` means "not recognized"; 1/2/3/4 mean set/reset/permanent).
+fn parse_synchronized_output_report(seq: &str) -> Option<bool> {
+    let body = seq.strip_prefix("\x1b[?")?.strip_suffix("$y")?;
+    let (mode, state) = body.split_once(';')?;
+    if mode != "2026" {
+        return None;
+    }
+    Some(state.parse::<u8>().ok()? != 0)
+}
+
 pub fn spawn_input_reader() -> mpsc::Receiver<RawInputEvent> {
     let (tx, rx) = mpsc::channel(256);
 
@@ -564,6 +579,13 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
 
         if let Some(appearance) = parse_host_color_scheme_report(&buffer[..seq_len]) {
             return Some((RawInputEvent::HostColorSchemeChanged(appearance), seq_len));
+        }
+
+        if let Some(supported) = parse_synchronized_output_report(seq) {
+            return Some((
+                RawInputEvent::HostSynchronizedOutputReport(supported),
+                seq_len,
+            ));
         }
 
         if let Some(mouse) = parse_sgr_mouse(seq) {
@@ -2052,5 +2074,29 @@ mod tests {
         // Window closed: a later lone Escape flushes immediately.
         assert!(framer.push(b"\x1b").is_empty());
         assert_eq!(framer.flush_timeout(), vec![b"\x1b".to_vec()]);
+    }
+
+    #[test]
+    fn parses_synchronized_output_decrpm_reports() {
+        // 1/2/3/4 = recognized -> supported; 0 = not recognized.
+        for (reply, expected) in [
+            (&b"\x1b[?2026;1$y"[..], true),
+            (&b"\x1b[?2026;2$y"[..], true),
+            (&b"\x1b[?2026;0$y"[..], false),
+        ] {
+            let events = parse_raw_input_bytes_sync(reply);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [RawInputEvent::HostSynchronizedOutputReport(got)] if *got == expected
+                ),
+                "reply {reply:?} -> {events:?}"
+            );
+        }
+
+        // A reply for a different mode must not be read as a 2026 report.
+        assert!(!parse_raw_input_bytes_sync(b"\x1b[?1049;1$y")
+            .iter()
+            .any(|e| matches!(e, RawInputEvent::HostSynchronizedOutputReport(_))));
     }
 }
